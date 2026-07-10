@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
-from statsmodels.tsa.stattools import adfuller
 
 # ============================================================
 # SHARED FUNCTIONS (used by both tabs)
@@ -65,83 +64,6 @@ def get_spread(symbol_a, symbol_b, period):
     df["raw_hedge_ratio"] = raw_hedge_ratio
     df["spread"] = (df["A_close"] - (hedge_ratio * df["B_close"])).round(2)
     return df
-
-def run_adf_test(series):
-    series = series.dropna()
-    result = adfuller(series)
-    return result[0], result[1]
-
-def backtest_walkforward(df, order, cluster_pct, zone_pct, entry_threshold=2.0,
-                          exit_threshold=0.5, min_touches=2):
-    """
-    Walk-forward backtest: at each candidate entry date, zones are recalculated using
-    ONLY data available up to and including that date - never future data. A zone only
-    counts for confluence once it has accumulated MORE THAN min_touches touches based on
-    what was knowable at that point in time. This avoids the look-ahead bias of computing
-    zones once from the full period and applying them to earlier trades.
-    """
-    position = None
-    entry_date = None
-    entry_zscore = None
-    entry_spread = None
-    trades = []
-
-    min_data_points = order * 2 + 5  # need enough history for argrelextrema to work meaningfully
-
-    for i, (date, row) in enumerate(df.iterrows()):
-        z = row["zscore"]
-        spread = row["spread"]
-        if pd.isna(z):
-            continue
-
-        if position is None:
-            long_signal = z <= -entry_threshold
-            short_signal = z >= entry_threshold
-
-            if long_signal or short_signal:
-                # Only use data up to and including today - nothing from the future
-                historical_spread = df["spread"].iloc[:i + 1]
-
-                if len(historical_spread) < min_data_points:
-                    long_signal = short_signal = False
-                else:
-                    raw_support, raw_resistance = find_levels(
-                        historical_spread, order=order, cluster_threshold_pct=cluster_pct
-                    )
-                    all_levels = raw_support + raw_resistance
-
-                    support_candidates = [(p, c) for p, c in all_levels if p < spread]
-                    resistance_candidates = [(p, c) for p, c in all_levels if p > spread]
-
-                    merged_support = merge_overlapping_zones(support_candidates, zone_pct)
-                    merged_resistance = merge_overlapping_zones(resistance_candidates, zone_pct)
-
-                    # Only zones with MORE THAN min_touches count as valid for entry
-                    strong_support = [(l, u, c) for l, u, c in merged_support if c > min_touches]
-                    strong_resistance = [(l, u, c) for l, u, c in merged_resistance if c > min_touches]
-
-                    long_signal = long_signal and in_any_zone(spread, strong_support)
-                    short_signal = short_signal and in_any_zone(spread, strong_resistance)
-
-            if long_signal:
-                position, entry_date, entry_zscore, entry_spread = "long_spread", date, z, spread
-            elif short_signal:
-                position, entry_date, entry_zscore, entry_spread = "short_spread", date, z, spread
-
-        elif position == "long_spread" and z >= -exit_threshold:
-            pnl = round(spread - entry_spread, 2)
-            trades.append({"Type": "Long Spread", "Entry Date": entry_date.date(), "Exit Date": date.date(),
-                            "Entry Z": round(entry_zscore, 2), "Exit Z": round(z, 2),
-                            "Days Held": (date - entry_date).days, "P&L (Rs.)": pnl})
-            position = None
-        elif position == "short_spread" and z <= exit_threshold:
-            pnl = round(entry_spread - spread, 2)
-            trades.append({"Type": "Short Spread", "Entry Date": entry_date.date(), "Exit Date": date.date(),
-                            "Entry Z": round(entry_zscore, 2), "Exit Z": round(z, 2),
-                            "Days Held": (date - entry_date).days, "P&L (Rs.)": pnl})
-            position = None
-
-    return trades
 
 # ============================================================
 # SUPPORT/RESISTANCE FUNCTIONS (shared by both tabs)
@@ -302,14 +224,14 @@ st.title("NSE Research Tools")
 symbol_df = load_symbol_list()
 display_options = symbol_df["display"].tolist()
 
-tab1, tab2, tab3 = st.tabs(["Pair Stationarity Screener", "Support & Resistance Finder", "Unusual Volume Scanner"])
+tab1, tab2, tab3 = st.tabs(["Pair Spread Support/Resistance", "Support & Resistance Finder", "Unusual Volume Scanner"])
 
 # ============================================================
 # TAB 1: PAIR SCREENER
 # ============================================================
 
 with tab1:
-    st.write("Test whether two NSE stocks have a statistically mean-reverting price spread.")
+    st.write("Find historical support and resistance zones on the price spread between two NSE stocks.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -319,69 +241,32 @@ with tab1:
         symbol_b_display = st.selectbox("Second stock", options=display_options,
                                          index=default_index(display_options, "DRREDDY"), key="pair_b")
 
-    periods = ["6mo", "1y", "2y", "3y", "5y"]
+    periods = ["1y", "2y", "3y", "5y", "10y", "20y"]
 
-    chart_period = st.selectbox("Chart & Backtest Period", options=periods,
+    chart_period = st.selectbox("Chart Period", options=periods,
                                  index=periods.index("2y"), key="pair_chart_period",
-                                 help="Used for the spread chart, support/resistance zones, and backtest below")
+                                 help="Used for the spread chart and support/resistance zones below")
+
+    pair_sr_order = 5       # fixed sensitivity - how many neighboring points confirm a swing point
+    pair_sr_cluster = 0.5   # fixed cluster threshold (%) for grouping nearby raw swing points
+
+    pair_sr_zone = st.slider("Zone width (%)", min_value=1.0, max_value=5.0, value=3.0, step=0.5, key="pair_sr_zone")
 
     if st.button("Run Screening", key="run_screening"):
         symbol_a = extract_symbol(symbol_a_display) + ".NS"
         symbol_b = extract_symbol(symbol_b_display) + ".NS"
 
-        st.subheader(f"Stationarity Results: {symbol_a} vs {symbol_b}")
-
-        results = []
-        pass_count = 0
-        for period in periods:
-            try:
-                df = get_spread(symbol_a, symbol_b, period)
-                adf_stat, p_value = run_adf_test(df["spread"])
-                is_stationary = p_value < 0.05
-                if is_stationary:
-                    pass_count += 1
-                results.append({
-                    "Period": period,
-                    "ADF Statistic": round(adf_stat, 4),
-                    "p-value": round(p_value, 4),
-                    "Stationary?": "Yes" if is_stationary else "No"
-                })
-            except Exception as e:
-                results.append({"Period": period, "ADF Statistic": None, "p-value": None, "Stationary?": f"Failed: {e}"})
-
-        st.table(pd.DataFrame(results))
-        st.metric("Windows Passed", f"{pass_count} / {len(periods)}")
-
-        if pass_count >= 3:
-            st.success("Reasonably consistent evidence of mean-reversion.")
-        elif pass_count >= 1:
-            st.warning("Weak/inconsistent evidence.")
-        else:
-            st.error("No evidence of mean-reversion across any window tested.")
-
         try:
             df_chart = get_spread(symbol_a, symbol_b, chart_period)
             hedge_ratio = df_chart["hedge_ratio"].iloc[0]
             raw_hedge_ratio = df_chart["raw_hedge_ratio"].iloc[0]
-            window = 20
-            df_chart["spread_mean"] = df_chart["spread"].rolling(window).mean()
-            df_chart["spread_std"] = df_chart["spread"].rolling(window).std()
-            df_chart["zscore"] = (df_chart["spread"] - df_chart["spread_mean"]) / df_chart["spread_std"]
 
             st.subheader(f"Spread Chart ({chart_period})")
-            st.line_chart(df_chart[["spread", "spread_mean"]])
+            st.line_chart(df_chart["spread"])
 
-            # --- Support/Resistance on the spread (computed BEFORE backtest, used for confluence) ---
+            # --- Support/Resistance on the spread ---
             st.subheader("Support & Resistance on the Spread")
-            st.caption("Zones as of today, using the full available history - shown for reference. The backtest below recalculates its own zones at each historical date using only data available at that time.")
-
-            sr_col1, sr_col2, sr_col3 = st.columns(3)
-            with sr_col1:
-                pair_sr_order = st.slider("Sensitivity (order)", min_value=2, max_value=15, value=5, key="pair_sr_order")
-            with sr_col2:
-                pair_sr_cluster = st.slider("Cluster threshold (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1, key="pair_sr_cluster")
-            with sr_col3:
-                pair_sr_zone = st.slider("Zone width (%)", min_value=1.0, max_value=5.0, value=3.0, step=0.5, key="pair_sr_zone")
+            st.caption("Zones as of today, using the full available history.")
 
             current_spread = float(df_chart["spread"].iloc[-1])
 
@@ -413,46 +298,6 @@ with tab1:
                 for lower, upper, touches in merged_spread_resistance:
                     st.write(f"Rs.{lower:.2f} - Rs.{upper:.2f} ({touches} touches)")
 
-            # --- Backtest, now requiring walk-forward confluence with the zones above ---
-            st.subheader("Backtest: Z-score + Support/Resistance Confluence (Walk-Forward)")
-
-            min_touches = st.slider("Minimum zone touches required before it counts", min_value=1, max_value=5, value=2, key="pair_min_touches")
-
-            st.caption(
-                "Hypothetical trades only. No real money, no transaction costs included. "
-                "An entry only triggers when the z-score threshold AND the spread sitting inside "
-                "a support/resistance zone agree (long only inside a support zone, short only inside "
-                "a resistance zone)."
-            )
-            st.info(
-                f"Zones are recalculated at each candidate entry date using ONLY data available up "
-                f"to that date - never future data. A zone only counts once it has more than "
-                f"{min_touches} touches based on what was knowable at that point in time. This avoids "
-                f"the look-ahead bias of computing zones once from the full period."
-            )
-
-            trades = backtest_walkforward(
-                df_chart,
-                order=pair_sr_order,
-                cluster_pct=pair_sr_cluster,
-                zone_pct=pair_sr_zone,
-                min_touches=min_touches
-            )
-
-            if trades:
-                trades_df = pd.DataFrame(trades)
-                st.table(trades_df)
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Total Trades", len(trades_df))
-                c2.metric("Avg Days Held", f"{trades_df['Days Held'].mean():.1f}")
-                c3.metric("Avg P&L per Trade", f"Rs.{trades_df['P&L (Rs.)'].mean():.2f}")
-
-                win_rate = (trades_df["P&L (Rs.)"] > 0).mean() * 100
-                st.metric("Win Rate", f"{win_rate:.1f}% ({(trades_df['P&L (Rs.)'] > 0).sum()} of {len(trades_df)})")
-            else:
-                st.info("No trades triggered - z-score signal and support/resistance zones never aligned with these settings.")
-
             # --- Ratio-adjusted price comparison ---
             st.subheader("Ratio-Adjusted Price Comparison")
             df_chart["B_adjusted"] = df_chart["B_close"] * hedge_ratio
@@ -460,7 +305,7 @@ with tab1:
             st.caption(f"B's price scaled by the rounded hedge ratio ({hedge_ratio}, raw was {raw_hedge_ratio:.4f}) so both lines are visually comparable. The gap between the lines is the spread shown above.")
 
         except Exception as e:
-            st.error(f"Could not generate chart/backtest/S&R: {e}")
+            st.error(f"Could not generate chart/S&R: {e}")
 
 # ============================================================
 # TAB 2: SUPPORT/RESISTANCE FINDER (single stock)
@@ -474,14 +319,13 @@ with tab2:
 
     period_options = ["3mo", "6mo", "1y", "2y", "3y", "5y", "10y"]
 
-    c1, c2, c3, c4 = st.columns(4)
+    order = 5       # fixed sensitivity - how many neighboring points confirm a swing point
+    cluster_pct = 0.5   # fixed cluster threshold (%) for grouping nearby raw swing points
+
+    c1, c2 = st.columns(2)
     with c1:
-        order = st.slider("Sensitivity (order)", min_value=2, max_value=15, value=5, key="sr_order")
-    with c2:
-        cluster_pct = st.slider("Cluster threshold (%)", min_value=0.1, max_value=2.0, value=0.5, step=0.1, key="sr_cluster")
-    with c3:
         selected_period = st.selectbox("Time period", options=period_options, index=2, key="sr_period")
-    with c4:
+    with c2:
         zone_pct = st.slider("Zone width (%)", min_value=1.0, max_value=5.0, value=3.0, step=0.5, key="sr_zone")
 
     if st.button("Find Levels", key="find_levels"):
