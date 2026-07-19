@@ -183,11 +183,36 @@ def _fetch_1min_bars_yfinance_batch(symbols):
                         progress=False, threads=True)
     return tickers, data
 
+# NSE cash market hours: 9:15 AM - 3:30 PM IST. The first and last 5 minutes
+# naturally see structurally higher volume for every stock (opening/closing
+# auctions, order accumulation) - including these would flag "unusual" volume
+# that isn't actually unusual, just a normal feature of market open/close.
+from datetime import time as _time
+_MARKET_OPEN = _time(9, 15)
+_EXCLUDE_OPEN_UNTIL = _time(9, 20)   # exclude 9:15:00 - 9:19:59
+_EXCLUDE_CLOSE_FROM = _time(15, 25)  # exclude 15:25:00 - 15:30:00
+_MARKET_CLOSE = _time(15, 30)
+
+def _is_excluded_bar(timestamp):
+    t = timestamp.time()
+    if _MARKET_OPEN <= t < _EXCLUDE_OPEN_UNTIL:
+        return True
+    if _EXCLUDE_CLOSE_FROM <= t <= _MARKET_CLOSE:
+        return True
+    return False
+
+def _filter_market_hours(df):
+    """Drops bars in the first 5 and last 5 minutes of the trading session."""
+    keep_mask = [not _is_excluded_bar(ts) for ts in df.index]
+    return df[keep_mask]
+
 def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_source="yfinance"):
     """
     Compares the most recent 1-minute bar's volume against the average of the
     preceding lookback_bars 1-minute bars, per symbol. Flags symbols where the
-    ratio exceeds min_ratio.
+    ratio exceeds min_ratio. Excludes the first/last 5 minutes of the trading
+    session from consideration, since volume there is structurally elevated
+    for every stock, not a genuine anomaly.
     """
     if data_source == "yfinance":
         tickers, data = _fetch_1min_bars_yfinance_batch(symbols)
@@ -201,6 +226,7 @@ def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_sour
     for symbol, ticker in zip(symbols, tickers):
         try:
             stock_data = data if len(tickers) == 1 else data[ticker]
+            stock_data = _filter_market_hours(stock_data)
 
             volume = stock_data["Volume"].dropna()
             close = stock_data["Close"].dropna()
@@ -216,16 +242,25 @@ def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_sour
 
             ratio = latest_volume / avg_volume
             latest_close = close.iloc[-1]
+            prev_close = close.iloc[-2] if len(close) >= 2 else latest_close
+            pct_change = (latest_close - prev_close) / prev_close * 100 if prev_close else 0
+
             latest_time = volume.index[-1]
-            time_str = latest_time.strftime("%H:%M:%S") if hasattr(latest_time, "strftime") else str(latest_time)
+            if hasattr(latest_time, "strftime"):
+                date_str = latest_time.strftime("%Y-%m-%d")
+                time_str = latest_time.strftime("%H:%M:%S")
+            else:
+                date_str, time_str = str(latest_time), ""
 
             if ratio >= min_ratio:
                 results.append({
                     "Symbol": symbol,
+                    "Date": date_str,
                     "Bar Time": time_str,
                     "Latest 1-Min Volume": int(latest_volume),
                     f"{lookback_bars}-Bar Avg Volume": int(avg_volume),
                     "Volume Ratio": round(ratio, 2),
+                    "Bar Price Change %": round(pct_change, 3),
                     "Latest Close": round(float(latest_close), 2),
                 })
         except Exception:
@@ -394,8 +429,10 @@ with tab3:
     st.caption(
         "Currently powered by Yahoo Finance (yfinance), which only provides 1-minute data for "
         "the last ~7 days - this is a hard limit of the free data source, not adjustable. Data "
-        "is also delayed (~15 min), not a true live feed. A broker API (e.g. 5paisa) integration "
-        "is planned to replace this data source later without changing this tab's layout."
+        "is also delayed (~15 min), not a true live feed. The first and last 5 minutes of the "
+        "trading session (9:15-9:20 AM and 3:25-3:30 PM) are excluded, since volume there is "
+        "structurally elevated for every stock, not a genuine anomaly. A broker API (e.g. 5paisa) "
+        "integration is planned to replace this data source later without changing this tab's layout."
     )
 
     all_symbols_1min = symbol_df["SYMBOL"].tolist()
