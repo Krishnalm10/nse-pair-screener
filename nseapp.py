@@ -164,51 +164,68 @@ DEFAULT_VOLUME_UNIVERSE = [
     "HCLTECH", "BEL"
 ]
 
-def scan_unusual_volume(symbols, lookback_days=20, min_ratio=2.0):
+# ============================================================
+# 1-MINUTE VOLUME SCANNER FUNCTIONS
+# ============================================================
+# Design note: data fetching is isolated in _fetch_1min_bars_yfinance_batch().
+# When a working 5paisa (or other broker) integration is ready, add a new
+# _fetch_1min_bars_5paisa_batch() function and route to it via the data_source
+# parameter below - the scanning/ratio logic itself won't need to change.
+
+def _fetch_1min_bars_yfinance_batch(symbols):
     """
-    Batch-downloads volume data for a list of NSE symbols and flags any where
-    the most recent day's volume exceeds min_ratio times the average of the
-    preceding lookback_days. Uses a single batched yfinance call for speed.
+    Fetches 1-minute bars for a list of NSE symbols via yfinance.
+    NOTE: yfinance only provides 1-minute data for the last ~7 days (a hard
+    limit of the free API, not something we can configure around).
     """
     tickers = [s + ".NS" for s in symbols]
-    period = f"{lookback_days + 15}d"  # extra buffer days for weekends/holidays
-
-    data = yf.download(tickers, period=period, interval="1d", group_by="ticker",
+    data = yf.download(tickers, period="1d", interval="1m", group_by="ticker",
                         progress=False, threads=True)
+    return tickers, data
+
+def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_source="yfinance"):
+    """
+    Compares the most recent 1-minute bar's volume against the average of the
+    preceding lookback_bars 1-minute bars, per symbol. Flags symbols where the
+    ratio exceeds min_ratio.
+    """
+    if data_source == "yfinance":
+        tickers, data = _fetch_1min_bars_yfinance_batch(symbols)
+    else:
+        raise NotImplementedError(
+            f"Data source '{data_source}' is not yet available. "
+            f"Only 'yfinance' is currently supported - 5paisa integration is pending."
+        )
 
     results = []
     for symbol, ticker in zip(symbols, tickers):
         try:
-            if len(tickers) == 1:
-                stock_data = data
-            else:
-                stock_data = data[ticker]
+            stock_data = data if len(tickers) == 1 else data[ticker]
 
             volume = stock_data["Volume"].dropna()
             close = stock_data["Close"].dropna()
 
-            if len(volume) < lookback_days + 1:
+            if len(volume) < lookback_bars + 1:
                 continue
 
             latest_volume = volume.iloc[-1]
-            avg_volume = volume.iloc[-(lookback_days + 1):-1].mean()  # excludes latest day
+            avg_volume = volume.iloc[-(lookback_bars + 1):-1].mean()  # excludes latest bar
 
             if avg_volume == 0 or pd.isna(avg_volume):
                 continue
 
             ratio = latest_volume / avg_volume
-
             latest_close = close.iloc[-1]
-            prev_close = close.iloc[-2] if len(close) >= 2 else latest_close
-            pct_change = (latest_close - prev_close) / prev_close * 100 if prev_close else 0
+            latest_time = volume.index[-1]
+            time_str = latest_time.strftime("%H:%M:%S") if hasattr(latest_time, "strftime") else str(latest_time)
 
             if ratio >= min_ratio:
                 results.append({
                     "Symbol": symbol,
-                    "Latest Volume": int(latest_volume),
-                    f"{lookback_days}-Day Avg Volume": int(avg_volume),
+                    "Bar Time": time_str,
+                    "Latest 1-Min Volume": int(latest_volume),
+                    f"{lookback_bars}-Bar Avg Volume": int(avg_volume),
                     "Volume Ratio": round(ratio, 2),
-                    "Price Change %": round(pct_change, 2),
                     "Latest Close": round(float(latest_close), 2),
                 })
         except Exception:
@@ -217,8 +234,6 @@ def scan_unusual_volume(symbols, lookback_days=20, min_ratio=2.0):
     return sorted(results, key=lambda x: -x["Volume Ratio"])
 
 
-
-st.set_page_config(page_title="NSE Research Tools", layout="centered")
 st.title("NSE Research Tools")
 
 symbol_df = load_symbol_list()
@@ -371,48 +386,54 @@ with tab2:
                     st.write(f"Rs.{lower:.2f} - Rs.{upper:.2f} ({touches} touches)")
 
 # ============================================================
-# TAB 3: UNUSUAL VOLUME SCANNER
+# TAB 3: UNUSUAL VOLUME SCANNER (1-Minute)
 # ============================================================
 
 with tab3:
-    st.write("Scan for NSE stocks trading at unusually high volume compared to their recent average.")
+    st.write("Scan for NSE stocks trading at unusually high volume on a 1-minute timeframe.")
     st.caption(
-        "Data is delayed (~15 min via Yahoo Finance, not a live exchange feed). If run during "
-        "market hours, today's volume is partial (market still open) and will look artificially "
-        "low against full-day historical averages - results are most meaningful after market close."
+        "Currently powered by Yahoo Finance (yfinance), which only provides 1-minute data for "
+        "the last ~7 days - this is a hard limit of the free data source, not adjustable. Data "
+        "is also delayed (~15 min), not a true live feed. A broker API (e.g. 5paisa) integration "
+        "is planned to replace this data source later without changing this tab's layout."
     )
 
-    all_symbols = symbol_df["SYMBOL"].tolist()
+    all_symbols_1min = symbol_df["SYMBOL"].tolist()
 
-    selected_symbols = st.multiselect(
+    selected_symbols_1min = st.multiselect(
         "Stocks to scan (defaults to Nifty 50 constituents - add or remove as needed)",
-        options=all_symbols,
-        default=[s for s in DEFAULT_VOLUME_UNIVERSE if s in all_symbols],
-        key="volume_symbols"
+        options=all_symbols_1min,
+        default=[s for s in DEFAULT_VOLUME_UNIVERSE if s in all_symbols_1min],
+        key="volume_symbols_1min"
     )
 
-    vol_col1, vol_col2 = st.columns(2)
-    with vol_col1:
-        lookback_days = st.slider("Lookback period for average volume (days)", min_value=5, max_value=60, value=20, key="volume_lookback")
-    with vol_col2:
-        min_ratio = st.slider("Minimum volume ratio to flag as 'unusual'", min_value=1.2, max_value=5.0, value=2.0, step=0.1, key="volume_min_ratio")
+    vol1_col1, vol1_col2 = st.columns(2)
+    with vol1_col1:
+        lookback_bars = st.slider("Lookback period for average volume (1-min bars)", min_value=5, max_value=60, value=20, key="volume_lookback_1min")
+    with vol1_col2:
+        min_ratio_1min = st.slider("Minimum volume ratio to flag as 'unusual'", min_value=1.2, max_value=5.0, value=2.0, step=0.1, key="volume_min_ratio_1min")
 
-    if len(selected_symbols) > 75:
-        st.warning("Large scans (75+ stocks) may be slow or hit rate limits. Consider narrowing the list.")
+    if len(selected_symbols_1min) > 40:
+        st.warning("1-minute data scans are heavier than daily scans. Large lists (40+ stocks) may be slow or hit rate limits - consider narrowing the list.")
 
-    if st.button("Scan for Unusual Volume", key="run_volume_scan"):
-        if not selected_symbols:
+    if st.button("Scan for Unusual 1-Min Volume", key="run_volume_scan_1min"):
+        if not selected_symbols_1min:
             st.warning("Select at least one stock to scan.")
         else:
-            with st.spinner(f"Scanning {len(selected_symbols)} stocks..."):
+            with st.spinner(f"Scanning {len(selected_symbols_1min)} stocks on a 1-minute timeframe..."):
                 try:
-                    results = scan_unusual_volume(selected_symbols, lookback_days=lookback_days, min_ratio=min_ratio)
+                    results_1min = scan_unusual_volume_1min(
+                        selected_symbols_1min,
+                        lookback_bars=lookback_bars,
+                        min_ratio=min_ratio_1min,
+                        data_source="yfinance"
+                    )
                 except Exception as e:
                     st.error(f"Scan failed: {e}")
-                    results = []
+                    results_1min = []
 
-            if results:
-                st.success(f"Found {len(results)} stock(s) with unusual volume (>= {min_ratio}x the {lookback_days}-day average).")
-                st.table(pd.DataFrame(results))
+            if results_1min:
+                st.success(f"Found {len(results_1min)} stock(s) with unusual 1-minute volume (>= {min_ratio_1min}x the {lookback_bars}-bar average).")
+                st.table(pd.DataFrame(results_1min))
             else:
                 st.info("No stocks matched the unusual volume threshold with these settings.")
