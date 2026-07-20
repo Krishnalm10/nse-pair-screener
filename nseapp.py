@@ -208,11 +208,12 @@ def _filter_market_hours(df):
 
 def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_source="yfinance"):
     """
-    Compares the most recent 1-minute bar's volume against the average of the
-    preceding lookback_bars 1-minute bars, per symbol. Flags symbols where the
-    ratio exceeds min_ratio. Excludes the first/last 5 minutes of the trading
-    session from consideration, since volume there is structurally elevated
-    for every stock, not a genuine anomaly.
+    Scans EVERY 1-minute bar in the day (not just the latest one) for each symbol,
+    comparing each bar's volume against the trailing average of the preceding
+    lookback_bars bars. Returns every bar where the ratio meets or exceeds min_ratio -
+    a stock can appear multiple times if it had several unusual spikes during the day.
+    Excludes the first/last 5 minutes of the trading session, since volume there is
+    structurally elevated for every stock, not a genuine anomaly.
     """
     if data_source == "yfinance":
         tickers, data = _fetch_1min_bars_yfinance_batch(symbols)
@@ -229,39 +230,36 @@ def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_sour
             stock_data = _filter_market_hours(stock_data)
 
             volume = stock_data["Volume"].dropna()
-            close = stock_data["Close"].dropna()
+            close = stock_data["Close"].reindex(volume.index)
 
             if len(volume) < lookback_bars + 1:
                 continue
 
-            latest_volume = volume.iloc[-1]
-            avg_volume = volume.iloc[-(lookback_bars + 1):-1].mean()  # excludes latest bar
+            # Rolling average of the PRECEDING lookback_bars bars, for every bar in the day
+            # (shift(1) excludes the current bar itself from its own average)
+            rolling_avg = volume.shift(1).rolling(lookback_bars).mean()
+            ratio_series = volume / rolling_avg
 
-            if avg_volume == 0 or pd.isna(avg_volume):
-                continue
+            prev_close = close.shift(1)
+            pct_change_series = (close - prev_close) / prev_close * 100
 
-            ratio = latest_volume / avg_volume
-            latest_close = close.iloc[-1]
-            prev_close = close.iloc[-2] if len(close) >= 2 else latest_close
-            pct_change = (latest_close - prev_close) / prev_close * 100 if prev_close else 0
+            valid_mask = rolling_avg.notna() & (rolling_avg > 0)
+            flagged_mask = valid_mask & (ratio_series >= min_ratio)
 
-            latest_time = volume.index[-1]
-            if hasattr(latest_time, "strftime"):
-                date_str = latest_time.strftime("%Y-%m-%d")
-                time_str = latest_time.strftime("%H:%M:%S")
-            else:
-                date_str, time_str = str(latest_time), ""
+            for ts in volume.index[flagged_mask]:
+                date_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)
+                time_str = ts.strftime("%H:%M:%S") if hasattr(ts, "strftime") else ""
+                pct_val = pct_change_series.loc[ts]
 
-            if ratio >= min_ratio:
                 results.append({
                     "Symbol": symbol,
                     "Date": date_str,
                     "Bar Time": time_str,
-                    "Latest 1-Min Volume": int(latest_volume),
-                    f"{lookback_bars}-Bar Avg Volume": int(avg_volume),
-                    "Volume Ratio": round(ratio, 2),
-                    "Bar Price Change %": round(pct_change, 3),
-                    "Latest Close": round(float(latest_close), 2),
+                    "Volume": int(volume.loc[ts]),
+                    f"{lookback_bars}-Bar Avg Volume": int(rolling_avg.loc[ts]),
+                    "Volume Ratio": round(float(ratio_series.loc[ts]), 2),
+                    "Bar Price Change %": round(float(pct_val), 3) if pd.notna(pct_val) else None,
+                    "Close": round(float(close.loc[ts]), 2),
                 })
         except Exception:
             continue  # skip symbols with missing/malformed data rather than failing the whole scan
@@ -425,7 +423,7 @@ with tab2:
 # ============================================================
 
 with tab3:
-    st.write("Scan for NSE stocks trading at unusually high volume on a 1-minute timeframe.")
+    st.write("Scan every 1-minute bar of the trading day for NSE stocks trading at unusually high volume. A stock can appear multiple times if it had several unusual spikes during the day.")
     st.caption(
         "Currently powered by Yahoo Finance (yfinance), which only provides 1-minute data for "
         "the last ~7 days - this is a hard limit of the free data source, not adjustable. Data "
@@ -470,7 +468,7 @@ with tab3:
                     results_1min = []
 
             if results_1min:
-                st.success(f"Found {len(results_1min)} stock(s) with unusual 1-minute volume (>= {min_ratio_1min}x the {lookback_bars}-bar average).")
+                st.success(f"Found {len(results_1min)} unusual-volume bar(s) across {len(selected_symbols_1min)} stock(s) (>= {min_ratio_1min}x the {lookback_bars}-bar average).")
                 st.table(pd.DataFrame(results_1min))
             else:
                 st.info("No stocks matched the unusual volume threshold with these settings.")
