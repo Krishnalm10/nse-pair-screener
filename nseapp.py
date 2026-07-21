@@ -186,14 +186,25 @@ def load_rank_universe():
 # _fetch_1min_bars_5paisa_batch() function and route to it via the data_source
 # parameter below - the scanning/ratio logic itself won't need to change.
 
-def _fetch_1min_bars_yfinance_batch(symbols):
+def _fetch_1min_bars_yfinance_batch(symbols, interval="1m"):
     """
-    Fetches 1-minute bars for a list of NSE symbols via yfinance.
-    NOTE: yfinance only provides 1-minute data for the last ~7 days (a hard
-    limit of the free API, not something we can configure around).
+    Fetches intraday bars for a list of NSE symbols via yfinance, at the given interval.
+    NOTE: yfinance's 1-minute data only covers the last ~7 days (a hard limit of the
+    free API). Longer intervals (2m/5m/15m) allow a longer lookback period, so we
+    fetch more history for those to ensure enough bars for a meaningful rolling average.
     """
+    # How much history to pull, chosen per interval to balance "enough bars for a
+    # rolling average" against yfinance's own limits for each interval.
+    period_by_interval = {
+        "1m": "1d",
+        "2m": "5d",
+        "5m": "5d",
+        "15m": "1mo",
+    }
+    period = period_by_interval.get(interval, "1d")
+
     tickers = [s + ".NS" for s in symbols]
-    data = yf.download(tickers, period="1d", interval="1m", group_by="ticker",
+    data = yf.download(tickers, period=period, interval=interval, group_by="ticker",
                         progress=False, threads=True)
     return tickers, data
 
@@ -220,17 +231,19 @@ def _filter_market_hours(df):
     keep_mask = [not _is_excluded_bar(ts) for ts in df.index]
     return df[keep_mask]
 
-def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_source="yfinance"):
+def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_source="yfinance", interval="1m"):
     """
-    Scans EVERY 1-minute bar in the day (not just the latest one) for each symbol,
+    Scans EVERY bar at the given interval (not just the latest one) for each symbol,
     comparing each bar's volume against the trailing average of the preceding
     lookback_bars bars. Returns every bar where the ratio meets or exceeds min_ratio -
-    a stock can appear multiple times if it had several unusual spikes during the day.
+    a stock can appear multiple times if it had several unusual spikes. Results are
+    grouped by symbol (each stock's entries appear together, ordered by that stock's
+    strongest spike first), with entries within a symbol sorted chronologically.
     Excludes the first/last 5 minutes of the trading session, since volume there is
     structurally elevated for every stock, not a genuine anomaly.
     """
     if data_source == "yfinance":
-        tickers, data = _fetch_1min_bars_yfinance_batch(symbols)
+        tickers, data = _fetch_1min_bars_yfinance_batch(symbols, interval=interval)
     else:
         raise NotImplementedError(
             f"Data source '{data_source}' is not yet available. "
@@ -267,6 +280,7 @@ def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_sour
 
                 results.append({
                     "Symbol": symbol,
+                    "_sort_ts": ts,  # internal, used only for chronological sort within a symbol
                     "Date": date_str,
                     "Bar Time": time_str,
                     "Volume": int(volume.loc[ts]),
@@ -278,7 +292,19 @@ def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_sour
         except Exception:
             continue  # skip symbols with missing/malformed data rather than failing the whole scan
 
-    return sorted(results, key=lambda x: -x["Volume Ratio"])
+    # Group entries by symbol (so a stock's multiple spikes appear together),
+    # ordering symbols by their strongest (max) ratio first, and sorting each
+    # symbol's own entries chronologically.
+    max_ratio_by_symbol = {}
+    for r in results:
+        max_ratio_by_symbol[r["Symbol"]] = max(max_ratio_by_symbol.get(r["Symbol"], 0), r["Volume Ratio"])
+
+    results.sort(key=lambda r: (-max_ratio_by_symbol[r["Symbol"]], r["Symbol"], r["_sort_ts"]))
+
+    for r in results:
+        del r["_sort_ts"]
+
+    return results
 
 
 st.title("NSE Research Tools")
@@ -465,26 +491,29 @@ with tab3:
             key="volume_symbols_1min"
         )
 
-    vol1_col1, vol1_col2 = st.columns(2)
+    vol1_col1, vol1_col2, vol1_col3 = st.columns(3)
     with vol1_col1:
-        lookback_bars = st.slider("Lookback period for average volume (1-min bars)", min_value=5, max_value=60, value=20, key="volume_lookback_1min")
+        interval_1min = st.selectbox("Bar interval", options=["1m", "2m", "5m", "15m"], index=0, key="volume_interval_1min")
     with vol1_col2:
+        lookback_bars = st.slider("Lookback period for average volume (bars)", min_value=5, max_value=60, value=20, key="volume_lookback_1min")
+    with vol1_col3:
         min_ratio_1min = st.slider("Minimum volume ratio to flag as 'unusual'", min_value=1.2, max_value=5.0, value=2.0, step=0.1, key="volume_min_ratio_1min")
 
     if len(selected_symbols_1min) > 40:
-        st.warning("1-minute data scans are heavier than daily scans. Large lists (40+ stocks) may be slow or hit rate limits - consider narrowing the list.")
+        st.warning("Intraday data scans are heavier than daily scans. Large lists (40+ stocks) may be slow or hit rate limits - consider narrowing the list.")
 
-    if st.button("Scan for Unusual 1-Min Volume", key="run_volume_scan_1min"):
+    if st.button("Scan for Unusual Volume", key="run_volume_scan_1min"):
         if not selected_symbols_1min:
             st.warning("Select at least one stock to scan.")
         else:
-            with st.spinner(f"Scanning {len(selected_symbols_1min)} stocks on a 1-minute timeframe..."):
+            with st.spinner(f"Scanning {len(selected_symbols_1min)} stocks at {interval_1min} intervals..."):
                 try:
                     results_1min = scan_unusual_volume_1min(
                         selected_symbols_1min,
                         lookback_bars=lookback_bars,
                         min_ratio=min_ratio_1min,
-                        data_source="yfinance"
+                        data_source="yfinance",
+                        interval=interval_1min
                     )
                 except Exception as e:
                     st.error(f"Scan failed: {e}")
