@@ -156,13 +156,27 @@ def in_any_zone(value, zones):
 # ============================================================
 
 # A verified list of liquid, large-cap NSE stocks (Nifty 50 constituents as of Jul 2026)
-# used as a sensible default universe - not the full NSE listing, to keep scans fast.
+# used as a fallback default universe if the rank-based CSV isn't available.
 DEFAULT_VOLUME_UNIVERSE = [
     "RELIANCE", "HDFCBANK", "BHARTIARTL", "ICICIBANK", "SBIN", "TCS", "BAJFINANCE",
     "LT", "HINDUNILVR", "SUNPHARMA", "MARUTI", "ADANIPORTS", "INFY", "ADANIENT",
     "AXISBANK", "TITAN", "KOTAKBANK", "M&M", "ITC", "NTPC", "ULTRACEMCO",
     "HCLTECH", "BEL"
 ]
+
+@st.cache_data
+def load_rank_universe():
+    """
+    Loads NSE symbols ranked 300-1000 by market cap (a one-time snapshot,
+    saved as market_cap_rank_300_1000.csv - refresh periodically by re-running
+    the scraper against stockanalysis.com/list/nse-india/ if a current ranking matters).
+    Falls back to the Nifty 50 list if the CSV isn't found.
+    """
+    try:
+        df = pd.read_csv("market_cap_rank_300_1000.csv")
+        return df["Symbol"].str.strip().tolist()
+    except FileNotFoundError:
+        return DEFAULT_VOLUME_UNIVERSE
 
 # ============================================================
 # 1-MINUTE VOLUME SCANNER FUNCTIONS
@@ -433,14 +447,23 @@ with tab3:
         "integration is planned to replace this data source later without changing this tab's layout."
     )
 
-    all_symbols_1min = symbol_df["SYMBOL"].tolist()
+    rank_universe = load_rank_universe()
+    valid_rank_universe = [s for s in rank_universe if s in symbol_df["SYMBOL"].tolist()]
 
-    selected_symbols_1min = st.multiselect(
-        "Stocks to scan (defaults to Nifty 50 constituents - add or remove as needed)",
-        options=all_symbols_1min,
-        default=[s for s in DEFAULT_VOLUME_UNIVERSE if s in all_symbols_1min],
-        key="volume_symbols_1min"
-    )
+    st.caption(f"Stock pool: NSE rank 300-1000 by market cap ({len(valid_rank_universe)} stocks).")
+
+    scan_all_ranked = st.checkbox(f"Scan all {len(valid_rank_universe)} stocks in this rank range (slower)", key="scan_all_ranked")
+
+    if scan_all_ranked:
+        selected_symbols_1min = valid_rank_universe
+        st.write(f"Selected: all {len(valid_rank_universe)} stocks (rank 300-1000).")
+    else:
+        selected_symbols_1min = st.multiselect(
+            "Or pick specific stocks to scan",
+            options=valid_rank_universe,
+            default=valid_rank_universe[:20],
+            key="volume_symbols_1min"
+        )
 
     vol1_col1, vol1_col2 = st.columns(2)
     with vol1_col1:
