@@ -521,6 +521,33 @@ with tab3:
 
             if results_1min:
                 st.success(f"Found {len(results_1min)} unusual-volume bar(s) across {len(selected_symbols_1min)} stock(s) (>= {min_ratio_1min}x the {lookback_bars}-bar average).")
-                st.table(pd.DataFrame(results_1min))
+
+                dates_present = sorted(set(r["Date"] for r in results_1min))
+                latest_date = dates_present[-1]
+
+                current_day_results = [r for r in results_1min if r["Date"] == latest_date]
+                previous_results = [r for r in results_1min if r["Date"] != latest_date]
+
+                st.subheader(f"Latest Session ({latest_date})")
+                if current_day_results:
+                    st.table(pd.DataFrame(current_day_results))
+                else:
+                    st.info(f"No unusual volume flagged on {latest_date}.")
+
+                if previous_results:
+                    st.subheader("Previous Sessions")
+
+                    by_date = {}
+                    for r in previous_results:
+                        by_date.setdefault(r["Date"], []).append(r)
+
+                    for date in sorted(by_date.keys(), reverse=True):
+                        entries = by_date[date]
+                        max_ratio_by_symbol = {}
+                        for e in entries:
+                            max_ratio_by_symbol[e["Symbol"]] = max(max_ratio_by_symbol.get(e["Symbol"], 0), e["Volume Ratio"])
+                        sorted_symbols = sorted(max_ratio_by_symbol.items(), key=lambda x: -x[1])
+                        symbol_desc = ", ".join(f"{sym} ({ratio}x)" for sym, ratio in sorted_symbols)
+                        st.write(f"**{date}:** Unusual volume seen in {symbol_desc}.")
             else:
                 st.info("No stocks matched the unusual volume threshold with these settings.")
