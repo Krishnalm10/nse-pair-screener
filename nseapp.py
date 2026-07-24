@@ -459,12 +459,20 @@ def get_earnings_reaction(symbol, num_quarters=8):
     return results, None
 
 
-def find_earnings_anomalies(results, surprise_threshold=5.0, reaction_threshold=2.0):
+def find_earnings_anomalies(results, surprise_threshold=5.0, reaction_threshold=2.0,
+                             high_surprise_threshold=25.0, high_surprise_reaction_threshold=1.0):
     """
     Flags quarters where the stock's EXCESS reaction (vs Nifty 50, isolating
     stock-specific movement) went the OPPOSITE direction from what the EPS
     surprise would suggest - e.g. a solid earnings beat but the stock still
     underperformed the market, or a miss that still outperformed the market.
+
+    Uses a tiered sensitivity: for very large surprises (>= high_surprise_threshold,
+    e.g. 25%), even a smaller opposite-direction reaction (>= high_surprise_reaction_threshold,
+    e.g. 1%) counts as an anomaly, since a huge beat/miss still failing to move the
+    stock as expected is notable even at a smaller magnitude. For more moderate
+    surprises, the standard (larger) reaction_threshold still applies.
+
     This is a factual flag for further research, not a signal to act on.
     """
     anomalies = []
@@ -473,9 +481,15 @@ def find_earnings_anomalies(results, surprise_threshold=5.0, reaction_threshold=
         excess = r.get("Excess Reaction %")
         if surprise is None or excess is None:
             continue
-        if surprise >= surprise_threshold and excess <= -reaction_threshold:
+
+        applicable_reaction_threshold = (
+            high_surprise_reaction_threshold if abs(surprise) >= high_surprise_threshold
+            else reaction_threshold
+        )
+
+        if surprise >= surprise_threshold and excess <= -applicable_reaction_threshold:
             anomalies.append(r)
-        elif surprise <= -surprise_threshold and excess >= reaction_threshold:
+        elif surprise <= -surprise_threshold and excess >= applicable_reaction_threshold:
             anomalies.append(r)
     return anomalies
 
