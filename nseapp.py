@@ -520,10 +520,13 @@ def research_anomaly_reason(symbol, company_name, report_date_str, surprise_pct,
 
 def compare_latest_to_history(earnings_results):
     """
-    Purely factual comparison of the most recent quarter against the stock's own
-    historical pattern (surprise magnitude, excess reaction magnitude, and whether
-    it matches a recurring anomaly pattern). Deliberately contains no directive
-    language (buy/sell/should) - describes the pattern, doesn't act on it.
+    1. States factually whether the latest report was a BEAT, MISS, or IN LINE
+       versus the analyst estimate.
+    2. Checks whether the latest report itself matches an anomaly pattern
+       (reaction went opposite direction from the surprise, vs Nifty 50).
+    3. If so, checks the previously downloaded/fetched reports for similar
+       (same-direction) anomalies and reports which dates they occurred on.
+    Deliberately contains no directive language (buy/sell/should).
     """
     if len(earnings_results) < 2:
         return None, "Need at least 2 quarters of data (1 latest + history to compare against)."
@@ -533,51 +536,56 @@ def compare_latest_to_history(earnings_results):
 
     lines = []
 
-    lines.append(
-        f"**Latest report ({latest['Report Date']}):** EPS Surprise {latest['EPS Surprise %']}%, "
-        f"Price Reaction {latest['Price Reaction %']}%, Nifty 50 Reaction {latest['Nifty 50 Reaction %']}%, "
-        f"Excess Reaction {latest['Excess Reaction %']}%."
-    )
+    # --- 1. Factual beat/miss verdict vs analyst estimate ---
+    eps_est = latest.get("EPS Estimate")
+    eps_actual = latest.get("Reported EPS")
+    surprise = latest.get("EPS Surprise %")
 
-    hist_surprises = [r["EPS Surprise %"] for r in historical if r["EPS Surprise %"] is not None]
-    if hist_surprises and latest["EPS Surprise %"] is not None:
-        avg_surprise = sum(hist_surprises) / len(hist_surprises)
+    if eps_est is not None and eps_actual is not None:
+        if surprise is not None and abs(surprise) < 1.0:
+            verdict = "IN LINE with"
+        elif eps_actual > eps_est:
+            verdict = "a BEAT vs"
+        elif eps_actual < eps_est:
+            verdict = "a MISS vs"
+        else:
+            verdict = "IN LINE with"
+        surprise_str = f" ({surprise}% surprise)" if surprise is not None else ""
         lines.append(
-            f"This quarter's EPS surprise ({latest['EPS Surprise %']}%) compares to a historical "
-            f"average of {avg_surprise:.2f}% across the {len(hist_surprises)} prior quarters shown."
+            f"**Latest report ({latest['Report Date']}):** Reported EPS {eps_actual} vs analyst "
+            f"estimate {eps_est}{surprise_str} - this was **{verdict} analyst estimates**."
         )
+    else:
+        lines.append(f"**Latest report ({latest['Report Date']}):** No analyst estimate available for comparison.")
 
-    hist_excess = [r["Excess Reaction %"] for r in historical if r["Excess Reaction %"] is not None]
-    if hist_excess and latest["Excess Reaction %"] is not None:
-        avg_excess = sum(hist_excess) / len(hist_excess)
-        lines.append(
-            f"This quarter's excess reaction vs Nifty 50 ({latest['Excess Reaction %']}%) compares "
-            f"to a historical average of {avg_excess:.2f}%."
-        )
-
+    # --- 2. Does the latest report itself match an anomaly pattern? ---
     latest_anomaly = find_earnings_anomalies([latest])
-    if latest_anomaly:
-        direction = ("beat estimates but reacted worse than the Nifty 50"
-                     if latest["EPS Surprise %"] > 0
-                     else "missed estimates but reacted better than the Nifty 50")
-        lines.append(f"This quarter itself is flagged as an anomaly: it {direction}.")
-    else:
-        lines.append("This quarter's reaction direction was broadly consistent with its EPS surprise direction (not flagged as an anomaly).")
-
     hist_anomalies = find_earnings_anomalies(historical)
-    if hist_anomalies:
-        beat_underperform = sum(1 for a in hist_anomalies if a["EPS Surprise %"] > 0)
-        miss_outperform = sum(1 for a in hist_anomalies if a["EPS Surprise %"] < 0)
-        lines.append(
-            f"Historically, {len(hist_anomalies)} of the {len(historical)} prior quarters shown were "
-            f"anomalies ({beat_underperform} beat-but-underperformed, {miss_outperform} missed-but-outperformed)."
-        )
-        if latest_anomaly and latest["EPS Surprise %"] > 0 and beat_underperform > miss_outperform:
-            lines.append("This matches a recurring pattern in this stock's history: beats have often still led to underperformance vs the Nifty 50.")
-        elif latest_anomaly and latest["EPS Surprise %"] < 0 and miss_outperform > beat_underperform:
-            lines.append("This matches a recurring pattern in this stock's history: misses have often still led to outperformance vs the Nifty 50.")
+
+    if latest_anomaly:
+        direction = ("beat estimates but the stock still underperformed the Nifty 50"
+                     if latest["EPS Surprise %"] > 0
+                     else "missed estimates but the stock still outperformed the Nifty 50")
+        lines.append(f"This report shows an anomaly: it {direction}.")
+
+        # --- 3. Check previously downloaded reports for similar (same-direction) anomalies ---
+        if hist_anomalies:
+            same_direction = [
+                a for a in hist_anomalies
+                if (a["EPS Surprise %"] > 0) == (latest["EPS Surprise %"] > 0)
+            ]
+            if same_direction:
+                dates_list = ", ".join(a["Report Date"] for a in same_direction)
+                lines.append(
+                    f"Similar anomalies were found in {len(same_direction)} of your previously "
+                    f"downloaded report(s): {dates_list}."
+                )
+            else:
+                lines.append("No similar anomaly was found in the previously downloaded reports for this stock - this appears to be a new pattern.")
+        else:
+            lines.append("No anomalies were found in the previously downloaded reports for this stock.")
     else:
-        lines.append(f"No anomalies were found in the {len(historical)} prior quarters shown - this stock's reaction has historically moved in the expected direction relative to its EPS surprise.")
+        lines.append("This report's reaction was consistent with its EPS surprise direction (no anomaly).")
 
     return "\n\n".join(lines), None
 
@@ -1007,8 +1015,9 @@ with tab4:
         # --- Factual comparison of latest quarter vs this stock's own history ---
         st.subheader("Compare Latest Report to History")
         st.caption(
-            "A factual comparison only - how the most recent quarter's numbers compare to this "
-            "stock's own historical pattern. This does not produce a buy/sell lean or recommendation."
+            "States factually whether the latest report was a beat/miss vs analyst estimates, then "
+            "checks whether it matches a similar anomaly pattern found in your previously downloaded "
+            "reports for this stock. No buy/sell lean or recommendation."
         )
         if st.button("Compare Latest Report", key="run_compare_latest"):
             comparison_text, compare_error = compare_latest_to_history(earnings_results)
