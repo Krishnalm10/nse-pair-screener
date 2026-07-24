@@ -618,6 +618,54 @@ def compare_latest_to_history(earnings_results):
     return "\n\n".join(lines), None
 
 
+def get_historical_base_rate(historical_results, new_surprise_pct, magnitude_tolerance_pct=10.0):
+    """
+    For a report that was JUST released (EPS numbers known, but price hasn't
+    reacted yet - so no Excess Reaction data exists for it), finds historical
+    quarters with a SIMILAR-MAGNITUDE, same-direction EPS surprise, and reports
+    what fraction of those were anomalies, with the specific dates.
+
+    This is a purely retrospective, statistical base rate - it makes no claim
+    or prediction about how the current report's stock will actually react.
+    """
+    if new_surprise_pct is None:
+        return None, "No EPS surprise value provided."
+
+    similar = [
+        r for r in historical_results
+        if r.get("EPS Surprise %") is not None
+        and (r["EPS Surprise %"] > 0) == (new_surprise_pct > 0)
+        and abs(r["EPS Surprise %"] - new_surprise_pct) <= magnitude_tolerance_pct
+    ]
+
+    if not similar:
+        return (
+            f"No historical quarters found with a similar-magnitude EPS surprise "
+            f"(within {magnitude_tolerance_pct} points of {new_surprise_pct}%)."
+        ), None
+
+    anomalies_among_similar = find_earnings_anomalies(similar)
+
+    lines = []
+    lines.append(
+        f"Found {len(similar)} historical quarter(s) with a similar-magnitude EPS surprise "
+        f"(within {magnitude_tolerance_pct} points of {new_surprise_pct}%)."
+    )
+    lines.append(
+        f"Of those, {len(anomalies_among_similar)} were flagged as anomalies historically "
+        f"(reaction went opposite direction from the surprise, vs the Nifty 50)."
+    )
+    if anomalies_among_similar:
+        lines.append("Anomaly date(s) found:")
+        for a in anomalies_among_similar:
+            lines.append(
+                f"- **{a['Report Date']}:** EPS Surprise {a['EPS Surprise %']}%, "
+                f"Excess Reaction {a['Excess Reaction %']}%"
+            )
+
+    return "\n\n".join(lines), None
+
+
 def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_source="yfinance", interval="1m"):
     """
     Scans EVERY bar at the given interval (not just the latest one) for each symbol,
@@ -1053,3 +1101,32 @@ with tab4:
                 st.warning(compare_error)
             else:
                 st.write(comparison_text)
+
+        # --- Live report: EPS known, price hasn't reacted yet ---
+        st.subheader("Live Report: Historical Base Rate")
+        st.caption(
+            "For a report that was JUST released - EPS is known, but the stock hasn't reacted yet, "
+            "so there's no price/Excess Reaction data for it. Enter the EPS numbers below and this "
+            "looks up how OTHER similarly-sized surprises for this stock have historically played out, "
+            "with the specific dates. This is a purely retrospective statistic - it does not predict "
+            "or flag how THIS report's stock price will move."
+        )
+
+        live_col1, live_col2 = st.columns(2)
+        with live_col1:
+            live_eps_estimate = st.number_input("EPS Estimate (analyst consensus)", value=0.0, step=0.01, key="live_eps_estimate")
+        with live_col2:
+            live_eps_actual = st.number_input("Reported EPS (just announced)", value=0.0, step=0.01, key="live_eps_actual")
+
+        if st.button("Check Historical Base Rate", key="run_live_base_rate"):
+            if live_eps_estimate == 0:
+                st.warning("Enter a non-zero EPS estimate to compute the surprise %.")
+            else:
+                live_surprise_pct = round((live_eps_actual - live_eps_estimate) / abs(live_eps_estimate) * 100, 2)
+                st.write(f"Computed EPS Surprise: **{live_surprise_pct}%**")
+
+                base_rate_text, base_rate_error = get_historical_base_rate(earnings_results, live_surprise_pct)
+                if base_rate_error:
+                    st.warning(base_rate_error)
+                else:
+                    st.write(base_rate_text)
