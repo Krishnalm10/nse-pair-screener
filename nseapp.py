@@ -1,3 +1,5 @@
+import os
+import time
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -231,6 +233,208 @@ def _filter_market_hours(df):
     keep_mask = [not _is_excluded_bar(ts) for ts in df.index]
     return df[keep_mask]
 
+# ============================================================
+# QUARTERLY EARNINGS REACTION FUNCTIONS
+# ============================================================
+# NOTE: this presents FACTUAL data only - EPS surprise and historical price/volume
+# reaction. It deliberately does NOT produce a buy/sell recommendation; quarterly
+# earnings reactions are notoriously hard to predict from a simple rule (a beat can
+# still crash a stock on weak guidance, a miss can rally on relief) - the person
+# reviewing this data should draw their own conclusion, not the app.
+
+def get_earnings_reaction(symbol, num_quarters=8):
+    """
+    Returns a list of past earnings dates for the symbol with EPS estimate/actual/
+    surprise, the stock's actual price and volume reaction, the Nifty 50's reaction
+    over the same window (to isolate stock-specific moves from market-wide moves),
+    and how each quarter's reaction compares statistically to the stock's own history.
+    Returns (results, error_message) - error_message is None on success.
+    """
+    ticker_symbol = symbol + ".NS"
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        earnings = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                earnings = ticker.get_earnings_dates(limit=num_quarters + 6)  # extra buffer, some rows are future/upcoming
+                break
+            except Exception as retry_error:
+                last_error = retry_error
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))  # brief backoff before retrying
+        if earnings is None:
+            raise last_error
+    except Exception as e:
+        return None, f"Could not fetch earnings dates after 3 attempts: {e}"
+
+    if earnings is None or earnings.empty:
+        return None, "No earnings date data available for this symbol on yfinance."
+
+    # Keep only PAST reports (future/upcoming estimates have no Reported EPS yet)
+    if "Reported EPS" not in earnings.columns:
+        return None, "Earnings data for this symbol doesn't include reported EPS figures."
+
+    past_earnings = earnings.dropna(subset=["Reported EPS"]).sort_index(ascending=False).head(num_quarters)
+
+    if past_earnings.empty:
+        return None, "No past reported earnings found for this symbol."
+
+    # Fetch daily price/volume history spanning all the report dates, with padding
+    start = (past_earnings.index.min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    end = (past_earnings.index.max() + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+
+    try:
+        hist = ticker.history(start=start, end=end)
+    except Exception as e:
+        return None, f"Could not fetch price history: {e}"
+
+    if hist.empty:
+        return None, "No price history available to measure reaction."
+
+    hist_dates = hist.index.tz_localize(None) if hist.index.tz is not None else hist.index
+    hist = hist.set_axis(hist_dates)
+
+    # Fetch Nifty 50 over the same window, to isolate stock-specific reaction
+    # from broader market moves on the same day.
+    try:
+        nifty_hist = yf.Ticker("^NSEI").history(start=start, end=end)
+        nifty_dates = nifty_hist.index.tz_localize(None) if nifty_hist.index.tz is not None else nifty_hist.index
+        nifty_hist = nifty_hist.set_axis(nifty_dates)
+    except Exception:
+        nifty_hist = None
+        nifty_dates = None
+
+    results = []
+    for report_date, row in past_earnings.iterrows():
+        try:
+            report_date_naive = report_date.tz_localize(None) if report_date.tzinfo is not None else report_date
+
+            before_dates = hist_dates[hist_dates < report_date_naive]
+            after_dates = hist_dates[hist_dates >= report_date_naive]
+
+            if len(before_dates) == 0 or len(after_dates) == 0:
+                continue
+
+            pre_date = before_dates[-1]
+            post_date = after_dates[0]
+
+            pre_close = float(hist.loc[pre_date, "Close"])
+            post_close = float(hist.loc[post_date, "Close"])
+            post_volume = float(hist.loc[post_date, "Volume"])
+
+            avg_vol_window = hist.loc[hist_dates < report_date_naive, "Volume"].tail(20)
+            avg_vol = avg_vol_window.mean() if len(avg_vol_window) > 0 else None
+            vol_ratio = (post_volume / avg_vol) if avg_vol and avg_vol > 0 else None
+
+            price_reaction_pct = (post_close - pre_close) / pre_close * 100 if pre_close else None
+
+            # Nifty 50's move over the SAME two dates, for comparison
+            nifty_reaction_pct = None
+            if nifty_hist is not None and pre_date in nifty_dates and post_date in nifty_dates:
+                nifty_pre = float(nifty_hist.loc[pre_date, "Close"])
+                nifty_post = float(nifty_hist.loc[post_date, "Close"])
+                nifty_reaction_pct = (nifty_post - nifty_pre) / nifty_pre * 100 if nifty_pre else None
+
+            excess_reaction_pct = (
+                price_reaction_pct - nifty_reaction_pct
+                if price_reaction_pct is not None and nifty_reaction_pct is not None
+                else None
+            )
+
+            eps_estimate = row.get("EPS Estimate")
+            reported_eps = row.get("Reported EPS")
+            surprise_pct = row.get("Surprise(%)")
+
+            results.append({
+                "Report Date": report_date_naive.strftime("%Y-%m-%d"),
+                "_report_date_obj": report_date_naive,
+                "EPS Estimate": round(float(eps_estimate), 2) if pd.notna(eps_estimate) else None,
+                "Reported EPS": round(float(reported_eps), 2) if pd.notna(reported_eps) else None,
+                "EPS Surprise %": round(float(surprise_pct), 2) if pd.notna(surprise_pct) else None,
+                "Price Reaction %": round(price_reaction_pct, 2) if price_reaction_pct is not None else None,
+                "Nifty 50 Reaction %": round(nifty_reaction_pct, 2) if nifty_reaction_pct is not None else None,
+                "Excess Reaction %": round(excess_reaction_pct, 2) if excess_reaction_pct is not None else None,
+                "Volume vs 20d Avg": round(vol_ratio, 2) if vol_ratio is not None else None,
+            })
+        except Exception:
+            continue  # skip this quarter if data alignment fails, rather than failing the whole result
+
+    if not results:
+        return None, "Could not compute price/volume reaction for any past earnings date."
+
+    return results, None
+
+
+def find_earnings_anomalies(results, surprise_threshold=5.0, reaction_threshold=2.0):
+    """
+    Flags quarters where the stock's EXCESS reaction (vs Nifty 50, isolating
+    stock-specific movement) went the OPPOSITE direction from what the EPS
+    surprise would suggest - e.g. a solid earnings beat but the stock still
+    underperformed the market, or a miss that still outperformed the market.
+    This is a factual flag for further research, not a signal to act on.
+    """
+    anomalies = []
+    for r in results:
+        surprise = r.get("EPS Surprise %")
+        excess = r.get("Excess Reaction %")
+        if surprise is None or excess is None:
+            continue
+        if surprise >= surprise_threshold and excess <= -reaction_threshold:
+            anomalies.append(r)
+        elif surprise <= -surprise_threshold and excess >= reaction_threshold:
+            anomalies.append(r)
+    return anomalies
+
+
+def research_anomaly_reason(symbol, company_name, report_date_str, surprise_pct, excess_reaction_pct):
+    """
+    Uses the Claude API (with web search) to research factual, disclosed reasons
+    for a specific earnings-reaction anomaly. Requires ANTHROPIC_API_KEY to be
+    set. Returns (summary_text, error_message). This is opt-in and makes a real,
+    billed API call each time it's used - only call this for specific flagged
+    anomalies, not in bulk.
+
+    IMPORTANT: this returns FACTUAL findings from news search, not a recommendation.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None, "ANTHROPIC_API_KEY is not set in your environment."
+
+    try:
+        import anthropic
+    except ImportError:
+        return None, "The 'anthropic' package isn't installed. Run: pip install anthropic"
+
+    direction = "beat estimates but the stock still underperformed the Nifty 50" if surprise_pct > 0 else \
+                "missed estimates but the stock still outperformed the Nifty 50"
+
+    prompt = (
+        f"On or around {report_date_str}, {company_name} ({symbol}.NS) reported quarterly results "
+        f"that {direction} (EPS surprise: {surprise_pct}%, excess price reaction vs Nifty 50: {excess_reaction_pct}%). "
+        f"Search for news from around that date and summarize the FACTUAL, disclosed reasons reported "
+        f"at the time for this reaction - e.g. management guidance, analyst commentary, sector-wide moves, "
+        f"promoter actions, regulatory news. Keep it to 3-4 sentences, cite what was actually reported, "
+        f"and do not offer any investment recommendation or opinion on whether this was a good or bad sign."
+    )
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text_parts = [block.text for block in response.content if hasattr(block, "text")]
+        summary = "\n".join(text_parts).strip()
+        if not summary:
+            return None, "No summary was returned - the search may not have found relevant results."
+        return summary, None
+    except Exception as e:
+        return None, f"API call failed: {e}"
+
+
 def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_source="yfinance", interval="1m"):
     """
     Scans EVERY bar at the given interval (not just the latest one) for each symbol,
@@ -312,7 +516,7 @@ st.title("NSE Research Tools")
 symbol_df = load_symbol_list()
 display_options = symbol_df["display"].tolist()
 
-tab1, tab2, tab3 = st.tabs(["Pair Spread Support/Resistance", "Support & Resistance Finder", "Unusual Volume Scanner"])
+tab1, tab2, tab3, tab4 = st.tabs(["Pair Spread Support/Resistance", "Support & Resistance Finder", "Unusual Volume Scanner", "Quarterly Earnings Reaction"])
 
 # ============================================================
 # TAB 1: PAIR SCREENER
@@ -551,3 +755,83 @@ with tab3:
                         st.write(f"**{date}:** Unusual volume seen in {symbol_desc}.")
             else:
                 st.info("No stocks matched the unusual volume threshold with these settings.")
+
+# ============================================================
+# TAB 4: QUARTERLY EARNINGS REACTION
+# ============================================================
+
+with tab4:
+    st.write("See how a stock has historically reacted (price and volume) to its last several quarterly earnings reports, compared against the Nifty 50's move on the same day.")
+    st.caption(
+        "This shows FACTUAL data only - EPS estimate vs. actual, the stock's real price/volume "
+        "reaction, and how that compares to the Nifty 50's move the same day (\"Excess Reaction\"). "
+        "It does not produce a buy/sell recommendation - that judgment is yours to make. Analyst "
+        "estimate coverage on Yahoo Finance also tends to be sparser for Indian mid/small-cap "
+        "stocks - some fields may show blank if no estimate data is available for a given quarter."
+    )
+
+    earnings_symbol_display = st.selectbox(
+        "Select stock", options=display_options,
+        index=default_index(display_options, "RELIANCE"), key="earnings_symbol"
+    )
+    num_quarters = st.slider("Number of past quarters to show", min_value=2, max_value=12, value=8, key="earnings_num_quarters")
+
+    if st.button("Get Earnings Reaction History", key="run_earnings_reaction"):
+        earnings_symbol = extract_symbol(earnings_symbol_display)
+        company_name_row = symbol_df[symbol_df["SYMBOL"] == earnings_symbol]
+        company_name = company_name_row["NAME OF COMPANY"].iloc[0] if not company_name_row.empty else earnings_symbol
+
+        with st.spinner(f"Fetching earnings history for {earnings_symbol}..."):
+            earnings_results, error = get_earnings_reaction(earnings_symbol, num_quarters=num_quarters)
+
+        if error:
+            st.warning(error)
+        else:
+            st.session_state["earnings_results"] = earnings_results
+            st.session_state["earnings_symbol_current"] = earnings_symbol
+            st.session_state["earnings_company_name"] = company_name
+
+    if "earnings_results" in st.session_state:
+        earnings_results = st.session_state["earnings_results"]
+        earnings_symbol = st.session_state["earnings_symbol_current"]
+        company_name = st.session_state["earnings_company_name"]
+
+        st.subheader(f"{earnings_symbol}: Last {len(earnings_results)} Quarterly Reports")
+
+        display_df = pd.DataFrame(earnings_results).drop(columns=["_report_date_obj"], errors="ignore")
+        st.table(display_df)
+
+        avg_excess = display_df["Excess Reaction %"].dropna().mean() if "Excess Reaction %" in display_df else None
+        if pd.notna(avg_excess):
+            st.metric("Average Excess Reaction vs Nifty 50 (all shown quarters)", f"{avg_excess:.2f}%")
+
+        # --- Anomaly detection: cases where excess reaction contradicts the EPS surprise direction ---
+        anomalies = find_earnings_anomalies(earnings_results)
+
+        if anomalies:
+            st.subheader("Flagged Anomalies")
+            st.caption(
+                "Quarters where the stock's reaction (vs Nifty 50) went the OPPOSITE direction from "
+                "what the EPS surprise would suggest - e.g. a clear beat that still underperformed "
+                "the market, or a miss that still outperformed it. Flagged for further research, not a signal."
+            )
+
+            for a in anomalies:
+                st.write(
+                    f"**{a['Report Date']}:** EPS Surprise {a['EPS Surprise %']}%, "
+                    f"Excess Reaction vs Nifty {a['Excess Reaction %']}%"
+                )
+
+                research_key = f"research_{earnings_symbol}_{a['Report Date']}"
+                if st.button(f"Research why ({a['Report Date']})", key=f"btn_{research_key}"):
+                    with st.spinner("Searching for factual context via Claude API (this makes a billed API call)..."):
+                        summary, research_error = research_anomaly_reason(
+                            earnings_symbol, company_name, a["Report Date"],
+                            a["EPS Surprise %"], a["Excess Reaction %"]
+                        )
+                    if research_error:
+                        st.error(research_error)
+                    else:
+                        st.info(summary)
+        else:
+            st.caption("No anomalies flagged (stock's reaction direction was broadly consistent with its EPS surprise direction, relative to the Nifty 50).")
