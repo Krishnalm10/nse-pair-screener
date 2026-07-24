@@ -6,6 +6,16 @@ import pandas as pd
 import numpy as np
 from scipy.signal import argrelextrema
 
+# On Streamlit Cloud, secrets are set via the dashboard (Settings -> Secrets) and
+# accessed through st.secrets, not os.environ. Locally (e.g. on your Mac), the key
+# comes from .zshrc via os.environ instead. This bridges the two so the rest of the
+# app can just use os.environ.get(...) everywhere, regardless of where it's running.
+try:
+    if "ANTHROPIC_API_KEY" in st.secrets:
+        os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
+except Exception:
+    pass  # no secrets configured (e.g. running locally without a secrets.toml) - fine, falls back to os.environ
+
 # ============================================================
 # SHARED FUNCTIONS (used by both tabs)
 # ============================================================
