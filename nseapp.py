@@ -242,6 +242,89 @@ def _filter_market_hours(df):
 # still crash a stock on weak guidance, a miss can rally on relief) - the person
 # reviewing this data should draw their own conclusion, not the app.
 
+BULK_EARNINGS_FILE = "quarterly_earnings_reports_top500.csv"
+
+@st.cache_data
+def load_bulk_earnings_csv():
+    """Loads the pre-fetched top-500 quarterly earnings CSV, if present. Returns None if not found."""
+    if not os.path.exists(BULK_EARNINGS_FILE):
+        return None
+    try:
+        df = pd.read_csv(BULK_EARNINGS_FILE)
+        return df
+    except Exception:
+        return None
+
+@st.cache_data
+def load_nifty_long_history():
+    """
+    Fetches Nifty 50's full history ONCE (cached, shared across every stock) so
+    we can compute each stock's excess reaction without re-fetching Nifty per stock.
+    """
+    try:
+        hist = yf.Ticker("^NSEI").history(period="10y")
+        dates = hist.index.tz_localize(None) if hist.index.tz is not None else hist.index
+        hist = hist.set_axis(dates)
+        return hist, dates
+    except Exception:
+        return None, None
+
+def _nifty_reaction_for_date(nifty_hist, nifty_dates, report_date_naive):
+    """Nifty 50's % move over the same before/after trading-day window as a given report date."""
+    before_dates = nifty_dates[nifty_dates < report_date_naive]
+    after_dates = nifty_dates[nifty_dates >= report_date_naive]
+    if len(before_dates) == 0 or len(after_dates) == 0:
+        return None
+    pre_date = before_dates[-1]
+    post_date = after_dates[0]
+    try:
+        pre_close = float(nifty_hist.loc[pre_date, "Close"])
+        post_close = float(nifty_hist.loc[post_date, "Close"])
+        return (post_close - pre_close) / pre_close * 100 if pre_close else None
+    except Exception:
+        return None
+
+def get_earnings_reaction_from_bulk(symbol, bulk_df, nifty_hist, nifty_dates, num_quarters):
+    """
+    Reconstructs earnings reaction data for a symbol from the pre-fetched bulk CSV,
+    computing Nifty 50 reaction / excess reaction on the fly against the cached
+    long-range Nifty history. Returns None if the symbol isn't in the bulk file.
+    """
+    if bulk_df is None or nifty_hist is None:
+        return None
+
+    rows = bulk_df[bulk_df["Symbol"] == symbol].copy()
+    if rows.empty:
+        return None
+
+    rows["_report_date_obj"] = pd.to_datetime(rows["Report Date"])
+    rows = rows.sort_values("_report_date_obj", ascending=False).head(num_quarters)
+
+    results = []
+    for _, row in rows.iterrows():
+        report_date_naive = row["_report_date_obj"]
+        nifty_reaction = _nifty_reaction_for_date(nifty_hist, nifty_dates, report_date_naive)
+        price_reaction = row["Price Reaction %"] if pd.notna(row["Price Reaction %"]) else None
+        excess = (
+            round(price_reaction - nifty_reaction, 2)
+            if price_reaction is not None and nifty_reaction is not None
+            else None
+        )
+        results.append({
+            "Report Date": row["Report Date"],
+            "_report_date_obj": report_date_naive,
+            "EPS Estimate": row["EPS Estimate"] if pd.notna(row["EPS Estimate"]) else None,
+            "Reported EPS": row["Reported EPS"] if pd.notna(row["Reported EPS"]) else None,
+            "EPS Surprise %": row["EPS Surprise %"] if pd.notna(row["EPS Surprise %"]) else None,
+            "Price Reaction %": price_reaction,
+            "Nifty 50 Reaction %": round(nifty_reaction, 2) if nifty_reaction is not None else None,
+            "Excess Reaction %": excess,
+            "Volume vs 20d Avg": row["Volume vs 20d Avg"] if pd.notna(row["Volume vs 20d Avg"]) else None,
+        })
+
+    return results if results else None
+
+
 def get_earnings_reaction(symbol, num_quarters=8):
     """
     Returns a list of past earnings dates for the symbol with EPS estimate/actual/
@@ -433,6 +516,70 @@ def research_anomaly_reason(symbol, company_name, report_date_str, surprise_pct,
         return summary, None
     except Exception as e:
         return None, f"API call failed: {e}"
+
+
+def compare_latest_to_history(earnings_results):
+    """
+    Purely factual comparison of the most recent quarter against the stock's own
+    historical pattern (surprise magnitude, excess reaction magnitude, and whether
+    it matches a recurring anomaly pattern). Deliberately contains no directive
+    language (buy/sell/should) - describes the pattern, doesn't act on it.
+    """
+    if len(earnings_results) < 2:
+        return None, "Need at least 2 quarters of data (1 latest + history to compare against)."
+
+    latest = earnings_results[0]
+    historical = earnings_results[1:]
+
+    lines = []
+
+    lines.append(
+        f"**Latest report ({latest['Report Date']}):** EPS Surprise {latest['EPS Surprise %']}%, "
+        f"Price Reaction {latest['Price Reaction %']}%, Nifty 50 Reaction {latest['Nifty 50 Reaction %']}%, "
+        f"Excess Reaction {latest['Excess Reaction %']}%."
+    )
+
+    hist_surprises = [r["EPS Surprise %"] for r in historical if r["EPS Surprise %"] is not None]
+    if hist_surprises and latest["EPS Surprise %"] is not None:
+        avg_surprise = sum(hist_surprises) / len(hist_surprises)
+        lines.append(
+            f"This quarter's EPS surprise ({latest['EPS Surprise %']}%) compares to a historical "
+            f"average of {avg_surprise:.2f}% across the {len(hist_surprises)} prior quarters shown."
+        )
+
+    hist_excess = [r["Excess Reaction %"] for r in historical if r["Excess Reaction %"] is not None]
+    if hist_excess and latest["Excess Reaction %"] is not None:
+        avg_excess = sum(hist_excess) / len(hist_excess)
+        lines.append(
+            f"This quarter's excess reaction vs Nifty 50 ({latest['Excess Reaction %']}%) compares "
+            f"to a historical average of {avg_excess:.2f}%."
+        )
+
+    latest_anomaly = find_earnings_anomalies([latest])
+    if latest_anomaly:
+        direction = ("beat estimates but reacted worse than the Nifty 50"
+                     if latest["EPS Surprise %"] > 0
+                     else "missed estimates but reacted better than the Nifty 50")
+        lines.append(f"This quarter itself is flagged as an anomaly: it {direction}.")
+    else:
+        lines.append("This quarter's reaction direction was broadly consistent with its EPS surprise direction (not flagged as an anomaly).")
+
+    hist_anomalies = find_earnings_anomalies(historical)
+    if hist_anomalies:
+        beat_underperform = sum(1 for a in hist_anomalies if a["EPS Surprise %"] > 0)
+        miss_outperform = sum(1 for a in hist_anomalies if a["EPS Surprise %"] < 0)
+        lines.append(
+            f"Historically, {len(hist_anomalies)} of the {len(historical)} prior quarters shown were "
+            f"anomalies ({beat_underperform} beat-but-underperformed, {miss_outperform} missed-but-outperformed)."
+        )
+        if latest_anomaly and latest["EPS Surprise %"] > 0 and beat_underperform > miss_outperform:
+            lines.append("This matches a recurring pattern in this stock's history: beats have often still led to underperformance vs the Nifty 50.")
+        elif latest_anomaly and latest["EPS Surprise %"] < 0 and miss_outperform > beat_underperform:
+            lines.append("This matches a recurring pattern in this stock's history: misses have often still led to outperformance vs the Nifty 50.")
+    else:
+        lines.append(f"No anomalies were found in the {len(historical)} prior quarters shown - this stock's reaction has historically moved in the expected direction relative to its EPS surprise.")
+
+    return "\n\n".join(lines), None
 
 
 def scan_unusual_volume_1min(symbols, lookback_bars=20, min_ratio=2.0, data_source="yfinance", interval="1m"):
@@ -774,22 +921,41 @@ with tab4:
         "Select stock", options=display_options,
         index=default_index(display_options, "RELIANCE"), key="earnings_symbol"
     )
-    num_quarters = st.slider("Number of past quarters to show", min_value=2, max_value=12, value=8, key="earnings_num_quarters")
+    num_quarters = st.slider("Number of past quarters to show", min_value=2, max_value=40, value=8, key="earnings_num_quarters")
 
     if st.button("Get Earnings Reaction History", key="run_earnings_reaction"):
         earnings_symbol = extract_symbol(earnings_symbol_display)
         company_name_row = symbol_df[symbol_df["SYMBOL"] == earnings_symbol]
         company_name = company_name_row["NAME OF COMPANY"].iloc[0] if not company_name_row.empty else earnings_symbol
 
-        with st.spinner(f"Fetching earnings history for {earnings_symbol}..."):
-            earnings_results, error = get_earnings_reaction(earnings_symbol, num_quarters=num_quarters)
+        bulk_df = load_bulk_earnings_csv()
+        nifty_hist, nifty_dates = load_nifty_long_history()
 
-        if error:
+        earnings_results = None
+        error = None
+        data_source_label = None
+
+        if bulk_df is not None:
+            with st.spinner(f"Loading {earnings_symbol} from your downloaded bulk data..."):
+                earnings_results = get_earnings_reaction_from_bulk(
+                    earnings_symbol, bulk_df, nifty_hist, nifty_dates, num_quarters
+                )
+            if earnings_results:
+                data_source_label = "bulk download (quarterly_earnings_reports_top500.csv)"
+
+        if not earnings_results:
+            with st.spinner(f"Not found in bulk data - fetching {earnings_symbol} live from yfinance..."):
+                earnings_results, error = get_earnings_reaction(earnings_symbol, num_quarters=num_quarters)
+            if earnings_results:
+                data_source_label = "live yfinance fetch"
+
+        if error and not earnings_results:
             st.warning(error)
-        else:
+        elif earnings_results:
             st.session_state["earnings_results"] = earnings_results
             st.session_state["earnings_symbol_current"] = earnings_symbol
             st.session_state["earnings_company_name"] = company_name
+            st.session_state["earnings_source_label"] = data_source_label
 
     if "earnings_results" in st.session_state:
         earnings_results = st.session_state["earnings_results"]
@@ -797,6 +963,8 @@ with tab4:
         company_name = st.session_state["earnings_company_name"]
 
         st.subheader(f"{earnings_symbol}: Last {len(earnings_results)} Quarterly Reports")
+        if "earnings_source_label" in st.session_state:
+            st.caption(f"Source: {st.session_state['earnings_source_label']}")
 
         display_df = pd.DataFrame(earnings_results).drop(columns=["_report_date_obj"], errors="ignore")
         st.table(display_df)
@@ -835,3 +1003,16 @@ with tab4:
                         st.info(summary)
         else:
             st.caption("No anomalies flagged (stock's reaction direction was broadly consistent with its EPS surprise direction, relative to the Nifty 50).")
+
+        # --- Factual comparison of latest quarter vs this stock's own history ---
+        st.subheader("Compare Latest Report to History")
+        st.caption(
+            "A factual comparison only - how the most recent quarter's numbers compare to this "
+            "stock's own historical pattern. This does not produce a buy/sell lean or recommendation."
+        )
+        if st.button("Compare Latest Report", key="run_compare_latest"):
+            comparison_text, compare_error = compare_latest_to_history(earnings_results)
+            if compare_error:
+                st.warning(compare_error)
+            else:
+                st.write(comparison_text)
