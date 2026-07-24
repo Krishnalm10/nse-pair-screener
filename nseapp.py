@@ -403,8 +403,13 @@ def get_earnings_reaction(symbol, num_quarters=8):
         try:
             report_date_naive = report_date.tz_localize(None) if report_date.tzinfo is not None else report_date
 
-            before_dates = hist_dates[hist_dates < report_date_naive]
-            after_dates = hist_dates[hist_dates >= report_date_naive]
+            # NSE companies very commonly announce quarterly results AFTER market close.
+            # Treating the report date's own close as "post-reaction" would be wrong in
+            # that case, since the market hadn't yet had a chance to react that day - the
+            # first real reaction happens the NEXT trading day. We treat the report date
+            # itself (and anything before) as PRE, and only strictly later dates as POST.
+            before_dates = hist_dates[hist_dates <= report_date_naive]
+            after_dates = hist_dates[hist_dates > report_date_naive]
 
             if len(before_dates) == 0 or len(after_dates) == 0:
                 continue
