@@ -599,11 +599,15 @@ def compare_latest_to_history(earnings_results):
                 if (a["EPS Surprise %"] > 0) == (latest["EPS Surprise %"] > 0)
             ]
             if same_direction:
-                dates_list = ", ".join(a["Report Date"] for a in same_direction)
                 lines.append(
-                    f"Similar anomalies were found in {len(same_direction)} of your previously "
-                    f"downloaded report(s): {dates_list}."
+                    f"Similar anomalies were found in {len(same_direction)} of your previously downloaded report(s):"
                 )
+                for a in same_direction:
+                    lines.append(
+                        f"- **{a['Report Date']}:** EPS Surprise {a['EPS Surprise %']}%, "
+                        f"Price Reaction {a['Price Reaction %']}%, Nifty 50 Reaction {a['Nifty 50 Reaction %']}%, "
+                        f"Excess Reaction {a['Excess Reaction %']}%"
+                    )
             else:
                 lines.append("No similar anomaly was found in the previously downloaded reports for this stock - this appears to be a new pattern.")
         else:
