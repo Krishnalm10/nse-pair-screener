@@ -1,4 +1,6 @@
 streamlit
 yfinance
 pandas
-statsmodels
+numpy
+scipy
+lxml
