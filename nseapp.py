@@ -280,9 +280,13 @@ def load_nifty_long_history():
         return None, None
 
 def _nifty_reaction_for_date(nifty_hist, nifty_dates, report_date_naive):
-    """Nifty 50's % move over the same before/after trading-day window as a given report date."""
-    before_dates = nifty_dates[nifty_dates < report_date_naive]
-    after_dates = nifty_dates[nifty_dates >= report_date_naive]
+    """
+    Nifty 50's % move over the same before/after trading-day window as a given
+    report date. Uses the corrected logic: report date's own close is PRE, first
+    trading day strictly after is POST (accounts for after-market-close announcements).
+    """
+    before_dates = nifty_dates[nifty_dates <= report_date_naive]
+    after_dates = nifty_dates[nifty_dates > report_date_naive]
     if len(before_dates) == 0 or len(after_dates) == 0:
         return None
     pre_date = before_dates[-1]
@@ -296,9 +300,13 @@ def _nifty_reaction_for_date(nifty_hist, nifty_dates, report_date_naive):
 
 def get_earnings_reaction_from_bulk(symbol, bulk_df, nifty_hist, nifty_dates, num_quarters):
     """
-    Reconstructs earnings reaction data for a symbol from the pre-fetched bulk CSV,
-    computing Nifty 50 reaction / excess reaction on the fly against the cached
-    long-range Nifty history. Returns None if the symbol isn't in the bulk file.
+    Uses the pre-fetched bulk CSV only for the EPS Estimate/Reported/Surprise figures
+    (which have no date-window dependency, so the CSV values are reliable). Price and
+    volume reaction are always recomputed FRESH here, using the corrected pre/post
+    date logic, for both the stock and Nifty 50 together - this guarantees they're
+    computed consistently with each other and with the live-fetch path, rather than
+    trusting the CSV's originally-stored Price Reaction %, which used an older,
+    incorrect date-window assumption. Returns None if the symbol isn't in the bulk file.
     """
     if bulk_df is None or nifty_hist is None:
         return None
@@ -310,27 +318,65 @@ def get_earnings_reaction_from_bulk(symbol, bulk_df, nifty_hist, nifty_dates, nu
     rows["_report_date_obj"] = pd.to_datetime(rows["Report Date"])
     rows = rows.sort_values("_report_date_obj", ascending=False).head(num_quarters)
 
+    # Fetch this stock's own price/volume history fresh, spanning all its report dates
+    start = (rows["_report_date_obj"].min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    end = (rows["_report_date_obj"].max() + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    try:
+        stock_hist = yf.Ticker(symbol + ".NS").history(start=start, end=end)
+    except Exception:
+        return None
+
+    if stock_hist.empty:
+        return None
+
+    stock_dates = stock_hist.index.tz_localize(None) if stock_hist.index.tz is not None else stock_hist.index
+    stock_hist = stock_hist.set_axis(stock_dates)
+
     results = []
     for _, row in rows.iterrows():
-        report_date_naive = row["_report_date_obj"]
-        nifty_reaction = _nifty_reaction_for_date(nifty_hist, nifty_dates, report_date_naive)
-        price_reaction = row["Price Reaction %"] if pd.notna(row["Price Reaction %"]) else None
-        excess = (
-            round(price_reaction - nifty_reaction, 2)
-            if price_reaction is not None and nifty_reaction is not None
-            else None
-        )
-        results.append({
-            "Report Date": row["Report Date"],
-            "_report_date_obj": report_date_naive,
-            "EPS Estimate": row["EPS Estimate"] if pd.notna(row["EPS Estimate"]) else None,
-            "Reported EPS": row["Reported EPS"] if pd.notna(row["Reported EPS"]) else None,
-            "EPS Surprise %": row["EPS Surprise %"] if pd.notna(row["EPS Surprise %"]) else None,
-            "Price Reaction %": price_reaction,
-            "Nifty 50 Reaction %": round(nifty_reaction, 2) if nifty_reaction is not None else None,
-            "Excess Reaction %": excess,
-            "Volume vs 20d Avg": row["Volume vs 20d Avg"] if pd.notna(row["Volume vs 20d Avg"]) else None,
-        })
+        try:
+            report_date_naive = row["_report_date_obj"]
+
+            # Same corrected logic as the live-fetch path: report date's own close is
+            # PRE-reaction, first trading day strictly after is POST-reaction.
+            before_dates = stock_dates[stock_dates <= report_date_naive]
+            after_dates = stock_dates[stock_dates > report_date_naive]
+            if len(before_dates) == 0 or len(after_dates) == 0:
+                continue
+
+            pre_date = before_dates[-1]
+            post_date = after_dates[0]
+
+            pre_close = float(stock_hist.loc[pre_date, "Close"])
+            post_close = float(stock_hist.loc[post_date, "Close"])
+            post_volume = float(stock_hist.loc[post_date, "Volume"])
+
+            avg_vol_window = stock_hist.loc[stock_dates < pre_date, "Volume"].tail(20)
+            avg_vol = avg_vol_window.mean() if len(avg_vol_window) > 0 else None
+            vol_ratio = (post_volume / avg_vol) if avg_vol and avg_vol > 0 else None
+
+            price_reaction = (post_close - pre_close) / pre_close * 100 if pre_close else None
+            nifty_reaction = _nifty_reaction_for_date(nifty_hist, nifty_dates, report_date_naive)
+
+            excess = (
+                round(price_reaction - nifty_reaction, 2)
+                if price_reaction is not None and nifty_reaction is not None
+                else None
+            )
+
+            results.append({
+                "Report Date": row["Report Date"],
+                "_report_date_obj": report_date_naive,
+                "EPS Estimate": row["EPS Estimate"] if pd.notna(row["EPS Estimate"]) else None,
+                "Reported EPS": row["Reported EPS"] if pd.notna(row["Reported EPS"]) else None,
+                "EPS Surprise %": row["EPS Surprise %"] if pd.notna(row["EPS Surprise %"]) else None,
+                "Price Reaction %": round(price_reaction, 2) if price_reaction is not None else None,
+                "Nifty 50 Reaction %": round(nifty_reaction, 2) if nifty_reaction is not None else None,
+                "Excess Reaction %": excess,
+                "Volume vs 20d Avg": round(vol_ratio, 2) if vol_ratio is not None else None,
+            })
+        except Exception:
+            continue
 
     return results if results else None
 
