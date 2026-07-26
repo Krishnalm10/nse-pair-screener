@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -162,6 +163,165 @@ def cleanup_final_overlaps(zones):
 def in_any_zone(value, zones):
     """Check if a value falls within any (lower, upper, touches) zone."""
     return any(lower <= value <= upper for lower, upper, _ in zones)
+
+# ============================================================
+# PAPER TRADING SIMULATOR (self-contained, no external platform)
+# ============================================================
+# Automates a strategy the user defines (enter on a validated support zone,
+# fixed % stop loss, exit at nearest resistance or stop). No live money, no
+# external broker/platform - purely a simulated log for testing a rules-based
+# strategy before ever considering real capital.
+
+PAPER_TRADES_FILE = "paper_trades.json"
+
+def load_paper_trades():
+    if not os.path.exists(PAPER_TRADES_FILE):
+        return {"open": [], "closed": []}
+    try:
+        with open(PAPER_TRADES_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"open": [], "closed": []}
+
+def save_paper_trades(data):
+    with open(PAPER_TRADES_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def check_entry_signal(symbol, entry_type="support", stop_loss_pct=2.0, period="1y",
+                        order=5, cluster_pct=0.5, zone_pct=3.0, min_touches=2):
+    """
+    Checks whether a stock's CURRENT price is sitting inside a validated zone:
+    - entry_type="support": checks for a LONG entry (price in a support zone),
+      stop loss stop_loss_pct BELOW entry, target at the nearest resistance above.
+    - entry_type="resistance": checks for a SHORT entry (price in a resistance zone),
+      stop loss stop_loss_pct ABOVE entry, target at the nearest support below.
+    Returns None if no valid entry signal is found right now.
+    """
+    try:
+        data = yf.download(symbol + ".NS", period=period, interval="1d", progress=False)
+        if data.empty:
+            return None
+        close = data["Close"].squeeze()
+        current_price = float(close.iloc[-1])
+
+        raw_support, raw_resistance = find_levels(close, order=order, cluster_threshold_pct=cluster_pct)
+        all_levels = raw_support + raw_resistance
+
+        support_candidates = [(p, c) for p, c in all_levels if p < current_price]
+        resistance_candidates = [(p, c) for p, c in all_levels if p > current_price]
+
+        merged_support = cleanup_final_overlaps(merge_overlapping_zones(support_candidates, zone_pct))
+        merged_support = sorted(merged_support, key=lambda z: -z[0])  # nearest support first
+
+        merged_resistance = cleanup_final_overlaps(merge_overlapping_zones(resistance_candidates, zone_pct))
+        merged_resistance = sorted(merged_resistance, key=lambda z: z[0])  # nearest resistance first
+
+        if entry_type == "support":
+            zones_to_check = merged_support
+        elif entry_type == "resistance":
+            zones_to_check = merged_resistance
+        else:
+            return None
+
+        matching_zone = None
+        for lower, upper, touches in zones_to_check:
+            if lower <= current_price <= upper and touches > min_touches:
+                matching_zone = (lower, upper, touches)
+                break
+
+        if matching_zone is None:
+            return None
+
+        if entry_type == "support":
+            direction = "LONG"
+            stop_loss_price = round(current_price * (1 - stop_loss_pct / 100), 2)
+            target_price = round(merged_resistance[0][0], 2) if merged_resistance else None
+        else:
+            direction = "SHORT"
+            stop_loss_price = round(current_price * (1 + stop_loss_pct / 100), 2)
+            target_price = round(merged_support[0][0], 2) if merged_support else None
+
+        return {
+            "direction": direction,
+            "entry_price": round(current_price, 2),
+            "stop_loss_price": stop_loss_price,
+            "target_price": target_price,
+            "zone_lower": round(matching_zone[0], 2),
+            "zone_upper": round(matching_zone[1], 2),
+            "zone_touches": matching_zone[2],
+        }
+    except Exception:
+        return None
+
+def open_paper_trade(symbol, signal):
+    trades = load_paper_trades()
+    trades["open"].append({
+        "symbol": symbol,
+        "direction": signal["direction"],
+        "entry_date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+        "entry_price": signal["entry_price"],
+        "stop_loss_price": signal["stop_loss_price"],
+        "target_price": signal["target_price"],
+        "zone_lower": signal["zone_lower"],
+        "zone_upper": signal["zone_upper"],
+        "zone_touches": signal["zone_touches"],
+    })
+    save_paper_trades(trades)
+
+def check_and_close_open_positions():
+    """
+    Re-checks every open simulated position against the current price. Closes
+    (moves to 'closed') any position that has hit its stop loss or target.
+    Handles both LONG (support entry) and SHORT (resistance entry) positions,
+    where stop/target directions are reversed relative to each other.
+    Returns the list of trades that were closed in this check.
+    """
+    trades = load_paper_trades()
+    still_open = []
+    newly_closed = []
+
+    for pos in trades["open"]:
+        try:
+            data = yf.download(pos["symbol"] + ".NS", period="5d", interval="1d", progress=False)
+            if data.empty:
+                still_open.append(pos)
+                continue
+            current_price = float(data["Close"].squeeze().iloc[-1])
+            direction = pos.get("direction", "LONG")  # default to LONG for any pre-existing trades
+
+            exit_reason = None
+            if direction == "LONG":
+                if current_price <= pos["stop_loss_price"]:
+                    exit_reason = "Stop Loss Hit"
+                elif pos["target_price"] is not None and current_price >= pos["target_price"]:
+                    exit_reason = "Target Hit"
+            else:  # SHORT
+                if current_price >= pos["stop_loss_price"]:
+                    exit_reason = "Stop Loss Hit"
+                elif pos["target_price"] is not None and current_price <= pos["target_price"]:
+                    exit_reason = "Target Hit"
+
+            if exit_reason:
+                if direction == "LONG":
+                    pnl_pct = round((current_price - pos["entry_price"]) / pos["entry_price"] * 100, 2)
+                else:  # SHORT profits when price falls
+                    pnl_pct = round((pos["entry_price"] - current_price) / pos["entry_price"] * 100, 2)
+
+                closed_pos = dict(pos)
+                closed_pos["exit_date"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+                closed_pos["exit_price"] = round(current_price, 2)
+                closed_pos["exit_reason"] = exit_reason
+                closed_pos["pnl_pct"] = pnl_pct
+                trades["closed"].append(closed_pos)
+                newly_closed.append(closed_pos)
+            else:
+                still_open.append(pos)
+        except Exception:
+            still_open.append(pos)
+
+    trades["open"] = still_open
+    save_paper_trades(trades)
+    return newly_closed
 
 # ============================================================
 # UNUSUAL VOLUME SCANNER FUNCTIONS
@@ -798,13 +958,14 @@ st.title("NSE Research Tools")
 symbol_df = load_symbol_list()
 display_options = symbol_df["display"].tolist()
 
-tab1, tab2, tab3, tab4 = st.tabs(["Pair Spread Support/Resistance", "Support & Resistance Finder", "Unusual Volume Scanner", "Quarterly Earnings Reaction"])
+PAGE_NAMES = ["Pair Spread Support/Resistance", "Support & Resistance Finder", "Unusual Volume Scanner", "Quarterly Earnings Reaction", "Paper Trading Simulator"]
+selected_page = st.sidebar.radio("Navigate to:", PAGE_NAMES)
 
 # ============================================================
 # TAB 1: PAIR SCREENER
 # ============================================================
 
-with tab1:
+if selected_page == "Pair Spread Support/Resistance":
     st.write("Find historical support and resistance zones on the price spread between two NSE stocks.")
 
     col1, col2 = st.columns(2)
@@ -885,7 +1046,7 @@ with tab1:
 # TAB 2: SUPPORT/RESISTANCE FINDER (single stock)
 # ============================================================
 
-with tab2:
+elif selected_page == "Support & Resistance Finder":
     st.write("Find historical support and resistance zones for any NSE stock.")
 
     symbol_display = st.selectbox("Select stock", options=display_options,
@@ -948,7 +1109,7 @@ with tab2:
 # TAB 3: UNUSUAL VOLUME SCANNER (1-Minute)
 # ============================================================
 
-with tab3:
+elif selected_page == "Unusual Volume Scanner":
     st.write("Scan every 1-minute bar of the trading day for NSE stocks trading at unusually high volume. A stock can appear multiple times if it had several unusual spikes during the day.")
     st.caption(
         "Currently powered by Yahoo Finance (yfinance), which only provides 1-minute data for "
@@ -1042,7 +1203,7 @@ with tab3:
 # TAB 4: QUARTERLY EARNINGS REACTION
 # ============================================================
 
-with tab4:
+elif selected_page == "Quarterly Earnings Reaction":
     st.write("See how a stock has historically reacted (price and volume) to its last several quarterly earnings reports, compared against the Nifty 50's move on the same day.")
     st.caption(
         "This shows FACTUAL data only - EPS estimate vs. actual, the stock's real price/volume "
@@ -1181,3 +1342,97 @@ with tab4:
                     st.warning(base_rate_error)
                 else:
                     st.write(base_rate_text)
+
+
+# ============================================================
+# TAB 5: PAPER TRADING SIMULATOR
+# ============================================================
+
+elif selected_page == "Paper Trading Simulator":
+    st.write("Automates a simple, rules-based strategy: enter when price is sitting inside a validated support zone, with a fixed 2% stop loss. This is a simulated log only - no real money, no external broker.")
+    st.caption(
+        "Entry rule: current price inside a support zone with more than a chosen number of "
+        "historical touches. Exit rule: 2% stop loss below entry, or reaching the nearest "
+        "resistance zone as a target. This automates a strategy you define - it does not "
+        "generate the strategy itself or tell you whether to trade."
+    )
+
+    sim_col1, sim_col2, sim_col3, sim_col4 = st.columns(4)
+    with sim_col1:
+        sim_symbol_display = st.selectbox(
+            "Stock to check for entry signal", options=display_options,
+            index=default_index(display_options, "RELIANCE"), key="sim_symbol"
+        )
+    with sim_col2:
+        sim_entry_type_label = st.selectbox(
+            "Entry type", options=["Support (Long)", "Resistance (Short)"], key="sim_entry_type"
+        )
+        sim_entry_type = "support" if sim_entry_type_label == "Support (Long)" else "resistance"
+    with sim_col3:
+        sim_stop_loss_pct = st.slider("Stop loss (%)", min_value=0.5, max_value=10.0, value=2.0, step=0.5, key="sim_stop_loss_pct")
+    with sim_col4:
+        sim_min_touches = st.slider("Minimum zone touches", min_value=1, max_value=10, value=2, key="sim_min_touches")
+
+    if st.button("Check for Entry Signal", key="run_check_entry"):
+        sim_symbol = extract_symbol(sim_symbol_display)
+        with st.spinner(f"Checking {sim_symbol} for a {sim_entry_type_label.lower()} entry signal..."):
+            signal = check_entry_signal(
+                sim_symbol, entry_type=sim_entry_type,
+                stop_loss_pct=sim_stop_loss_pct, min_touches=sim_min_touches
+            )
+
+        if signal is None:
+            st.info(f"No entry signal right now - {sim_symbol}'s current price isn't sitting inside a validated {sim_entry_type} zone.")
+            st.session_state.pop("sim_signal", None)
+        else:
+            st.session_state["sim_signal"] = signal
+            st.session_state["sim_signal_symbol"] = sim_symbol
+
+    if "sim_signal" in st.session_state:
+        signal = st.session_state["sim_signal"]
+        sim_symbol = st.session_state["sim_signal_symbol"]
+        zone_type = "support" if signal["direction"] == "LONG" else "resistance"
+        st.success(
+            f"{signal['direction']} entry signal found for {sim_symbol}: price {signal['entry_price']} is inside a "
+            f"{zone_type} zone ({signal['zone_lower']} - {signal['zone_upper']}, {signal['zone_touches']} touches)."
+        )
+        st.write(f"Simulated entry: **{signal['entry_price']}**, Stop Loss: **{signal['stop_loss_price']}**, Target: **{signal['target_price']}**")
+        if st.button("Open Simulated Trade", key="run_open_trade"):
+            open_paper_trade(sim_symbol, signal)
+            st.success(f"Simulated trade opened for {sim_symbol}.")
+            st.session_state.pop("sim_signal", None)
+
+    st.divider()
+
+    st.subheader("Open Positions")
+    if st.button("Refresh & Check Exits", key="run_check_exits"):
+        with st.spinner("Checking open positions against current prices..."):
+            newly_closed = check_and_close_open_positions()
+        if newly_closed:
+            for c in newly_closed:
+                st.info(f"Closed: {c['symbol']} - {c['exit_reason']} at {c['exit_price']} (P&L: {c['pnl_pct']}%)")
+        else:
+            st.write("No positions hit their stop loss or target since the last check.")
+
+    trades = load_paper_trades()
+
+    if trades["open"]:
+        st.table(pd.DataFrame(trades["open"]))
+    else:
+        st.caption("No open simulated positions.")
+
+    st.subheader("Closed Trades / P&L History")
+    if trades["closed"]:
+        closed_df = pd.DataFrame(trades["closed"])
+        st.table(closed_df)
+
+        total_trades = len(closed_df)
+        win_count = (closed_df["pnl_pct"] > 0).sum()
+        avg_pnl = closed_df["pnl_pct"].mean()
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Closed Trades", total_trades)
+        c2.metric("Win Rate", f"{win_count / total_trades * 100:.1f}%")
+        c3.metric("Average P&L per Trade", f"{avg_pnl:.2f}%")
+    else:
+        st.caption("No closed trades yet.")
