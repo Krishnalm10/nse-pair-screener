@@ -195,12 +195,18 @@ def check_entry_signal(symbol, entry_type="support", stop_loss_pct=2.0, period="
       stop loss stop_loss_pct BELOW entry, target at the nearest resistance above.
     - entry_type="resistance": checks for a SHORT entry (price in a resistance zone),
       stop loss stop_loss_pct ABOVE entry, target at the nearest support below.
-    Returns None if no valid entry signal is found right now.
+
+    Always returns a dict with "checked_at" (timestamp) and either a full signal
+    (if found) or "reason" explaining specifically why no signal was found, so you
+    can see the pattern over time and adjust your sensitivity/threshold settings.
     """
+    checked_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
     try:
         data = yf.download(symbol + ".NS", period=period, interval="1d", progress=False)
         if data.empty:
-            return None
+            return {"signal": None, "checked_at": checked_at, "reason": f"No price data returned for {symbol}."}
+
         close = data["Close"].squeeze()
         current_price = float(close.iloc[-1])
 
@@ -216,21 +222,48 @@ def check_entry_signal(symbol, entry_type="support", stop_loss_pct=2.0, period="
         merged_resistance = cleanup_final_overlaps(merge_overlapping_zones(resistance_candidates, zone_pct))
         merged_resistance = sorted(merged_resistance, key=lambda z: z[0])  # nearest resistance first
 
-        if entry_type == "support":
-            zones_to_check = merged_support
-        elif entry_type == "resistance":
-            zones_to_check = merged_resistance
-        else:
-            return None
+        zones_to_check = merged_support if entry_type == "support" else merged_resistance
 
+        if not zones_to_check:
+            return {
+                "signal": None, "checked_at": checked_at,
+                "reason": f"No {entry_type} zones were detected at all for {symbol} at current settings "
+                          f"(price {round(current_price, 2)}). Try lowering 'Sensitivity (order)' or "
+                          f"widening 'Zone width' to detect more zones."
+            }
+
+        # Track the CLOSEST zone even if it doesn't qualify, so we can explain why
         matching_zone = None
+        closest_zone = None
+        closest_distance = None
         for lower, upper, touches in zones_to_check:
-            if lower <= current_price <= upper and touches > min_touches:
+            in_zone = lower <= current_price <= upper
+            if in_zone and touches > min_touches:
                 matching_zone = (lower, upper, touches)
                 break
+            distance = 0 if in_zone else min(abs(current_price - lower), abs(current_price - upper))
+            if closest_distance is None or distance < closest_distance:
+                closest_distance = distance
+                closest_zone = (lower, upper, touches, in_zone)
 
         if matching_zone is None:
-            return None
+            if closest_zone and closest_zone[3]:  # was inside a zone, just not enough touches
+                lower, upper, touches, _ = closest_zone
+                reason = (
+                    f"Price {round(current_price, 2)} is inside a {entry_type} zone ({round(lower,2)}-{round(upper,2)}) "
+                    f"but it only has {touches} touch(es), below your minimum of {min_touches}. "
+                    f"Try lowering 'Minimum zone touches'."
+                )
+            elif closest_zone:
+                lower, upper, touches, _ = closest_zone
+                reason = (
+                    f"Price {round(current_price, 2)} is not inside any {entry_type} zone right now. "
+                    f"Nearest {entry_type} zone: {round(lower,2)}-{round(upper,2)} ({touches} touches). "
+                    f"Try widening 'Zone width' so nearby zones capture the current price."
+                )
+            else:
+                reason = f"No qualifying {entry_type} zone found for {symbol} at current settings."
+            return {"signal": None, "checked_at": checked_at, "reason": reason}
 
         if entry_type == "support":
             direction = "LONG"
@@ -242,16 +275,45 @@ def check_entry_signal(symbol, entry_type="support", stop_loss_pct=2.0, period="
             target_price = round(merged_support[0][0], 2) if merged_support else None
 
         return {
-            "direction": direction,
-            "entry_price": round(current_price, 2),
-            "stop_loss_price": stop_loss_price,
-            "target_price": target_price,
-            "zone_lower": round(matching_zone[0], 2),
-            "zone_upper": round(matching_zone[1], 2),
-            "zone_touches": matching_zone[2],
+            "signal": {
+                "direction": direction,
+                "entry_price": round(current_price, 2),
+                "stop_loss_price": stop_loss_price,
+                "target_price": target_price,
+                "zone_lower": round(matching_zone[0], 2),
+                "zone_upper": round(matching_zone[1], 2),
+                "zone_touches": matching_zone[2],
+            },
+            "checked_at": checked_at,
+            "reason": None,
         }
+    except Exception as e:
+        return {"signal": None, "checked_at": checked_at, "reason": f"Error while checking: {e}"}
+
+SIGNAL_CHECK_LOG_FILE = "signal_check_log.json"
+
+def load_signal_check_log():
+    if not os.path.exists(SIGNAL_CHECK_LOG_FILE):
+        return []
+    try:
+        with open(SIGNAL_CHECK_LOG_FILE, "r") as f:
+            return json.load(f)
     except Exception:
-        return None
+        return []
+
+def log_signal_check(symbol, entry_type, result):
+    log = load_signal_check_log()
+    log.append({
+        "symbol": symbol,
+        "entry_type": entry_type,
+        "checked_at": result["checked_at"],
+        "signal_found": result["signal"] is not None,
+        "reason": result["reason"] if result["signal"] is None else "Signal found",
+    })
+    log = log[-200:]  # keep the log from growing unbounded
+    with open(SIGNAL_CHECK_LOG_FILE, "w") as f:
+        json.dump(log, f, indent=2)
+
 
 def open_paper_trade(symbol, signal):
     trades = load_paper_trades()
@@ -1376,24 +1438,28 @@ elif selected_page == "Paper Trading Simulator":
     if st.button("Check for Entry Signal", key="run_check_entry"):
         sim_symbol = extract_symbol(sim_symbol_display)
         with st.spinner(f"Checking {sim_symbol} for a {sim_entry_type_label.lower()} entry signal..."):
-            signal = check_entry_signal(
+            result = check_entry_signal(
                 sim_symbol, entry_type=sim_entry_type,
                 stop_loss_pct=sim_stop_loss_pct, min_touches=sim_min_touches
             )
 
-        if signal is None:
-            st.info(f"No entry signal right now - {sim_symbol}'s current price isn't sitting inside a validated {sim_entry_type} zone.")
+        log_signal_check(sim_symbol, sim_entry_type, result)
+
+        if result["signal"] is None:
+            st.info(f"[{result['checked_at']}] No entry signal - {result['reason']}")
             st.session_state.pop("sim_signal", None)
         else:
-            st.session_state["sim_signal"] = signal
+            st.session_state["sim_signal"] = result["signal"]
             st.session_state["sim_signal_symbol"] = sim_symbol
+            st.session_state["sim_signal_checked_at"] = result["checked_at"]
 
     if "sim_signal" in st.session_state:
         signal = st.session_state["sim_signal"]
         sim_symbol = st.session_state["sim_signal_symbol"]
+        checked_at = st.session_state.get("sim_signal_checked_at", "")
         zone_type = "support" if signal["direction"] == "LONG" else "resistance"
         st.success(
-            f"{signal['direction']} entry signal found for {sim_symbol}: price {signal['entry_price']} is inside a "
+            f"[{checked_at}] {signal['direction']} entry signal found for {sim_symbol}: price {signal['entry_price']} is inside a "
             f"{zone_type} zone ({signal['zone_lower']} - {signal['zone_upper']}, {signal['zone_touches']} touches)."
         )
         st.write(f"Simulated entry: **{signal['entry_price']}**, Stop Loss: **{signal['stop_loss_price']}**, Target: **{signal['target_price']}**")
@@ -1401,6 +1467,13 @@ elif selected_page == "Paper Trading Simulator":
             open_paper_trade(sim_symbol, signal)
             st.success(f"Simulated trade opened for {sim_symbol}.")
             st.session_state.pop("sim_signal", None)
+
+    with st.expander("Recent Signal Check History (see why conditions did/didn't trigger)"):
+        check_log = load_signal_check_log()
+        if check_log:
+            st.table(pd.DataFrame(check_log[::-1]).head(30))  # most recent first
+        else:
+            st.caption("No checks logged yet.")
 
     st.divider()
 
